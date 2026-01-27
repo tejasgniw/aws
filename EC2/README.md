@@ -2,7 +2,9 @@
 
 - EC2: Elastic cloud compute
 
-- Login with key pair
+- Create an EC2 instance free tier with Ubuntu 24 Image
+
+- Login with to the EC2 using key pair
 
 ```
     For WSL: If the path starts with /mnt/c/, permissions will NOT change — Windows forces them to appear as 777 in WSL.
