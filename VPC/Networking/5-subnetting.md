@@ -1,4 +1,4 @@
-# Subnet Mask
+# Subneting based on number of networks needed.
 
 - For e.g. my IPV4 address & subnetmask of my laptop is
 
@@ -18,7 +18,7 @@ Where network bits = 11111111.11111111.11111111 (as 255 is in the first 3 Octets
 
 Let's say we would like to break the subnet mask (255.255.255.0) into **4 networks**.
 
-## Hack the host bits
+## Hack the host bits (from left to right)
 
 - Charts to calculate how many host bits you need to HACK and create 4 networks
 
@@ -32,7 +32,7 @@ Let's say we would like to break the subnet mask (255.255.255.0) into **4 networ
 
 - Now, since we need 4 networks and it needs to hack 2 bits from the host, it gives the following binary:
 
-11111111.11111111.11111111.11000000 (The ones are added after the decinmal as the Octets of Subnet mask are contiguous)
+11111111.11111111.11111111.11000000 (The ones are added after the decimal as the Octets of Subnet mask are contiguous)
 
 11111111.11111111.11111111.11000000 = 255.255.255.192 (New subnet mask after hacking the bits)
 
