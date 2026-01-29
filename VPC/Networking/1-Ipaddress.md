@@ -27,7 +27,7 @@ The following key concepts define how IP addresses work and how they are managed
 
 2. The Anatomy of an IP Address
 
-An IP address is composed of four sets of numbers separated by dots, known as octets. To understand how an IP address functions, it must be looked at alongside its "best friend," the subnet mask:
+An IP address is composed of four sets of numbers separated by dots, known as octets(8 bits). To understand how an IP address functions, it must be looked at alongside its "best friend," the subnet mask:
 
 - Network Portion: This is like the street name in a housing analogy. If a subnet mask contains 255 in an octet, the corresponding number in the IP address is "locked in" and remains the same for every device on that specific network. **E.g.** 192.168.2.2 is the IP address of your device, the 192.168.1 is the Network Portion, and if 255.255.255.0 is the subnet mask, all the network portion can only be the same i.e. the first 3 Octets: 192.168.2 will never change as the first 3 Octets are 255.
 

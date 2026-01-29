@@ -1,9 +1,9 @@
 # The calculation
 
-- An IPv4 address is 32 bits.
+- An IPv4 address is 32 bits(4 bytes).
 
 - Example:
-192.168.1.10 = 11000000.10101000.00000001.00001010
+192.168.1.10 (Decimal) = 11000000.10101000.00000001.00001010 (Binary)
 
 - For the following classes these bits are fixed:
 
