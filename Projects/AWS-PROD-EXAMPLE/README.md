@@ -7,7 +7,7 @@ The above example shows how to create a **production-grade VPC** for running app
 
 ## Steps: 
 
-- Create a VPC with NAT Gateway
+- Create a VPC with NAT Gateway per region.
 - Create an autoscaling group in private subnet (Needs launch template first)
 - Create a bastion host with public subnet
 - Copy the pem key in the bastion host to access the instances in private subnet
