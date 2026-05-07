@@ -1,0 +1,751 @@
+stages:
+  - setup
+  - buildcontainer
+  - build-v1
+  - test
+  - deploy
+  - endtoend
+  - notification
+
+.large-template:
+  variables:
+    KUBERNETES_CPU_REQUEST: 1000m
+    KUBERNETES_CPU_LIMIT: 1200m
+    KUBERNETES_MEMORY_REQUEST: 2500Mi
+    KUBERNETES_MEMORY_LIMIT: 2500Mi
+
+# Caches
+.node_modules-cache: &node_modules-cache
+  key:
+    files:
+      - yarn.lock
+  paths:
+    - node_modules
+  policy: pull
+
+.yarn-cache: &yarn-cache
+  key: yarn-$CI_JOB_IMAGE
+  paths:
+    - .yarn
+  policy: pull-push
+
+.angular-cache: &angular-cache
+  key: angular-$CI_JOB_IMAGE
+  paths:
+    - .angular
+  policy: pull-push
+
+# Gitlab Features
+
+include:
+  # Security and compliance jobs
+  - local: .gitlab/ci-templates/security/security.gitlab-ci.yml
+    rules:
+      - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+        when: always
+      - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_TAG'
+        when: always
+      - when: never
+
+  # Template to push image to ECR
+  - template: 'Workflows/Branch-Pipelines.gitlab-ci.yml'
+  - project: 'org/products/tandm/basecamp/platform/cicd/images-delivery-template'
+    ref: main
+    file: '/.images-delivery-template.yml'
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" # Run Incremental security scans in MR pipeline
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_TAG # Run full security scans in pipelines on the default branch (but not in other branch pipelines) and in pipelines for tags
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: $CI_COMMIT_BRANCH == "main"
+    - when: never # Workaround to prevent running detached + regular pipeline
+
+default:
+  image: $WEBAPP_ENV_IMAGE
+  tags:
+    - vpc-neutral
+  interruptible: true
+
+variables:
+  BUILD_ARTIFACT: dist/testflow
+  FF_USE_FASTZIP: 'true'
+  # These can be specified per job or per pipeline
+  ARTIFACT_COMPRESSION_LEVEL: 'fast'
+  CACHE_COMPRESSION_LEVEL: 'fastest'
+  SECURITY_SCAN_COMPONENT_GROUP: 'Exchange'
+  IMAGE_NAME: 'exchange-webapp'
+  IMAGE_VERSION: $CI_COMMIT_SHA
+  WEBAPP_ENV_IMAGE: registry.gitlab.com/org/products/tandm/basecamp/cloud/web-application/exchange-webapp-env:2.0
+
+.orgrunner-neutral:
+  tags:
+    - vpc-neutral
+
+.orgrunner-qa:
+  tags:
+    - vpc-qa
+
+.orgrunner-prod:
+  tags:
+    - vpc-prod
+
+.orgrunner-neutral-large:
+  tags:
+    - vpc-neutral-large
+
+#############
+## Setup
+##
+
+yarn-install:
+  stage: setup
+  extends:
+    - .orgrunner-neutral-large
+  before_script:
+    - echo "API_KEY=$AUTHORIZER_API_KEY"
+    - cp .npmrc.pipeline .npmrc
+  script:
+    - yarn install --frozen-lockfile --cache-folder .yarn
+  cache:
+    - <<: *node_modules-cache
+      policy: pull-push # We override the policy
+    - <<: *yarn-cache # This is not required if your internet speed is good or if you use a local npm registry.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "merge_request_event"' # To set interruptible to false for non merge requests pipelines
+      interruptible: false
+    - when: always
+
+.terraform_setup:
+  stage: setup
+  image: registry.gitlab.com/org/products/tandm/basecamp/cloud/aws-npm-terraform/tf-1.0.5-main:latest
+  before_script:
+    - cd terraform/${STATE_BUCKET_SUB_DIR}
+    - envsubst < backend.tf.tpl > backend.tf
+    - terraform init
+
+terraform:plan:mr:
+  stage: setup
+  only:
+    - merge_requests
+  extends:
+    - .terraform_setup
+  variables:
+    TF_VAR_access_key: $AWS_CLoudOps_SAAS_development_AccessKey
+    TF_VAR_secret_key: $AWS_CLoudOps_SAAS_development_SecretKey
+    TF_VAR_aws_region: 'us-east-1'
+    TF_VAR_bucket_name: 'web-merreqenvir756'
+    STATE_BUCKET_NAME: 'org-cloudops-terraform-state-saas-qa'
+    TF_VAR_base_href: $CI_MERGE_REQUEST_ID
+    STATE_BUCKET_SUB_DIR: 'mr-envir-ephemere'
+  script:
+    - terraform plan -out="terraform.plan"
+  artifacts:
+    paths:
+      - terraform/${STATE_BUCKET_SUB_DIR}/terraform.plan
+  resource_group: mr
+
+terraform:apply:mr:
+  stage: setup
+  only:
+    - merge_requests
+  extends:
+    - .terraform_setup
+  variables:
+    TF_VAR_access_key: $AWS_CLoudOps_SAAS_development_AccessKey
+    TF_VAR_secret_key: $AWS_CLoudOps_SAAS_development_SecretKey
+    TF_VAR_aws_region: 'us-east-1'
+    TF_VAR_bucket_name: 'web-merreqenvir756'
+    STATE_BUCKET_NAME: 'org-cloudops-terraform-state-saas-qa'
+    TF_VAR_base_href: $CI_MERGE_REQUEST_ID
+    STATE_BUCKET_SUB_DIR: 'mr-envir-ephemere'
+  script:
+    - terraform apply "terraform.plan"
+    - export DISTRIBUTION_ID=$(terraform output distribution_id)
+    - export WEB_DOMAIN=$(terraform output distribution_domain_name)
+    - echo "DISTRIBUTION_ID=$DISTRIBUTION_ID" >> ${CI_PROJECT_DIR}/deploy.env
+    - echo "WEB_DOMAIN=$WEB_DOMAIN" >> ${CI_PROJECT_DIR}/deploy.env
+  resource_group: mr
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    paths:
+      - deploy.env
+  needs:
+    - terraform:plan:mr
+
+terraform:plan:qa:
+  stage: setup
+  only:
+    - main
+  extends:
+    - .terraform_setup
+    - .orgrunner-qa
+  image: registry.gitlab.com/org/products/tandm/basecamp/cloud/aws-npm-terraform/tf-1.0.5-main:latest
+  variables:
+    TF_VAR_access_key: $AWS_CLoudOps_SAAS_development_AccessKey
+    TF_VAR_secret_key: $AWS_CLoudOps_SAAS_development_SecretKey
+    TF_VAR_aws_region: 'us-east-1'
+    TF_VAR_bucket_name: 'qa2-orgexchange-web'
+    STATE_BUCKET_NAME: 'org-cloudops-terraform-state-saas-qa'
+    STATE_BUCKET_SUB_DIR: 'qa'
+  script:
+    - terraform plan -out="terraform.plan"
+  artifacts:
+    paths:
+      - terraform/${STATE_BUCKET_SUB_DIR}/terraform.plan
+  resource_group: qa
+
+terraform:apply:qa:
+  stage: setup
+  only:
+    - main
+  extends:
+    - .terraform_setup
+    - .orgrunner-qa
+  image: registry.gitlab.com/org/products/tandm/basecamp/cloud/aws-npm-terraform/tf-1.0.5-main:latest
+  variables:
+    TF_VAR_access_key: $AWS_CLoudOps_SAAS_development_AccessKey
+    TF_VAR_secret_key: $AWS_CLoudOps_SAAS_development_SecretKey
+    TF_VAR_aws_region: 'us-east-1'
+    TF_VAR_bucket_name: 'qa2-orgexchange-web'
+    STATE_BUCKET_NAME: 'org-cloudops-terraform-state-saas-qa'
+    STATE_BUCKET_SUB_DIR: qa
+  script:
+    - terraform apply "terraform.plan"
+    - export DISTRIBUTION_ID=$(terraform output distribution_id)
+    - export WEB_DOMAIN=$(terraform output distribution_domain_name)
+    - echo "DISTRIBUTION_ID=$DISTRIBUTION_ID" >> ${CI_PROJECT_DIR}/deploy.env
+    - echo "WEB_DOMAIN=$WEB_DOMAIN" >> ${CI_PROJECT_DIR}/deploy.env
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    paths:
+      - deploy.env
+  resource_group: qa
+  needs:
+    - terraform:plan:qa
+
+terraform:plan:prod:
+  stage: setup
+  only:
+    - main
+  extends:
+    - .terraform_setup
+    - .orgrunner-prod
+  image: registry.gitlab.com/org/products/tandm/basecamp/cloud/aws-npm-terraform/tf-1.0.5-main:latest
+  variables:
+    TF_VAR_access_key: $AWS_CLoudOps_SAAS_production_AccessKey
+    TF_VAR_secret_key: $AWS_CLoudOps_SAAS_production_SecretKey
+    TF_VAR_aws_region: 'eu-central-1'
+    TF_VAR_bucket_name: 'prod-orgexchange-web'
+    STATE_BUCKET_NAME: 'org-cloudops-terraform-state-saas-production'
+    STATE_BUCKET_SUB_DIR: 'prod2'
+  script:
+    - terraform plan -out="terraform.plan"
+  artifacts:
+    paths:
+      - terraform/${STATE_BUCKET_SUB_DIR}/terraform.plan
+  resource_group: prod
+  when: manual
+
+terraform:apply:prod:
+  stage: setup
+  only:
+    - main
+  extends:
+    - .terraform_setup
+    - .orgrunner-prod
+  image: registry.gitlab.com/org/products/tandm/basecamp/cloud/aws-npm-terraform/tf-1.0.5-main:latest
+  variables:
+    TF_VAR_access_key: $AWS_CLoudOps_SAAS_production_AccessKey
+    TF_VAR_secret_key: $AWS_CLoudOps_SAAS_production_SecretKey
+    TF_VAR_aws_region: 'eu-central-1'
+    TF_VAR_bucket_name: 'prod-orgexchange-web'
+    STATE_BUCKET_NAME: 'org-cloudops-terraform-state-saas-production'
+    STATE_BUCKET_SUB_DIR: 'prod2'
+    DISTRIBUTION_ID: 'E3NHP0341I4FQN'
+    WEB_DOMAIN: 'd2rium1hq85npt.cloudfront.net'
+  script:
+    - terraform apply "terraform.plan"
+    - echo "DISTRIBUTION_ID=$DISTRIBUTION_ID" >> ${CI_PROJECT_DIR}/deploy.env
+    - echo "WEB_DOMAIN=$WEB_DOMAIN" >> ${CI_PROJECT_DIR}/deploy.env
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    paths:
+      - deploy.env
+  resource_group: prod
+  needs:
+    - terraform:plan:prod
+
+build-and-publish-env-image:
+  stage: setup
+  extends:
+    - .large-template
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: ['']
+  script:
+    - echo "IMAGE_TAG = '$IMAGE_TAG'"
+    - if [ -z $IMAGE_TAG ]; then
+      echo "IMAGE_TAG env variable must be set. Set the value manually and re-run the job. Exiting...";
+      exit 1;
+      fi
+    - DESTINATION="$CI_REGISTRY_IMAGE/exchange-webapp-env:$IMAGE_TAG"
+    - echo "DESTINATION = $DESTINATION"
+    - >
+      /kaniko/executor --destination "$DESTINATION" \
+        --context "${CI_PROJECT_DIR}" \
+        --dockerfile "${CI_PROJECT_DIR}/container/Dockerfile" \
+        --snapshot-mode=redo
+  when: manual
+  tags:
+    - vpc-neutral
+
+#############
+## Build Container
+##
+
+build-container:
+  stage: buildcontainer
+  image: $WEBAPP_ENV_IMAGE
+  only:
+    - main
+  variables:
+    BUILD: 'yarn build'
+  artifacts:
+    paths:
+      - $BUILD_ARTIFACT
+  extends:
+    - .orgrunner-neutral-large
+  script:
+    - cp src/environments/environment.dynamic.ts src/environments/environment.ts
+    - $BUILD
+  cache:
+    - <<: *node_modules-cache
+    - <<: *angular-cache
+  needs:
+    - yarn-install
+
+build-container:mr:
+  stage: buildcontainer
+  image: $WEBAPP_ENV_IMAGE
+  only:
+    - merge_requests
+  variables:
+    # Default is Development : optimization false, sourceMap true, buildOptimizer false
+    BUILD: 'ng build'
+  artifacts:
+    paths:
+      - $BUILD_ARTIFACT
+      - VERSION.txt
+  extends:
+    - .orgrunner-neutral-large
+  script:
+    - cp src/environments/environment.dynamic.ts src/environments/environment.ts
+    - $BUILD
+    - |
+      echo "$CI_COMMIT_SHORT_SHA-beta" > VERSION.txt
+      echo "Created VERSION.txt with: $CI_COMMIT_SHORT_SHA-beta"
+  cache:
+    - <<: *node_modules-cache
+    - <<: *angular-cache
+  needs:
+    - yarn-install
+  when: manual
+
+container:create:build:
+  stage: buildcontainer
+  only:
+    - main
+  needs:
+    - build-container
+  dependencies:
+    - build-container
+  extends:
+    - .container:create:build
+
+container:create:build:mr:
+  stage: buildcontainer
+  only:
+    - merge_requests
+  needs:
+    - build-container:mr
+  dependencies:
+    - build-container:mr
+  allow_failure: false
+  extends:
+    - .container:create:build
+
+#############
+## Build Application
+##
+
+.build-application:
+  stage: build-v1
+  image: $WEBAPP_ENV_IMAGE
+  extends:
+    - .orgrunner-neutral-large
+  script:
+    - export LONG_MR_ID=${CI_MERGE_REQUEST_ID}
+    - export SHORT_MR_ID=${CI_COMMIT_SHORT_SHA}
+    - export SENTRY_RELEASE=${CI_COMMIT_SHORT_SHA}
+    - node src/assets/webComponent/scripts/replace-${ENVIRONMENT}-manifest.js
+    - node src/environments/scripts/replace-${ENVIRONMENT}-env.js
+    - $BUILD
+  cache:
+    - <<: *node_modules-cache
+    - <<: *angular-cache
+
+build-application:mr:
+  extends:
+    - .build-application
+  only:
+    - merge_requests
+  variables:
+    BUILD: 'yarn build --base-href /$CI_MERGE_REQUEST_ID/'
+    ENVIRONMENT: 'mr'
+  artifacts:
+    paths:
+      - $BUILD_ARTIFACT
+  needs:
+    - yarn-install
+
+build-application:qa:
+  extends:
+    - .build-application
+  only:
+    - main
+  variables:
+    BUILD: 'yarn build'
+    ENVIRONMENT: 'qa'
+  artifacts:
+    paths:
+      - $BUILD_ARTIFACT
+  needs:
+    - terraform:apply:qa
+    - yarn-install
+
+build-application:prod:
+  extends:
+    - .build-application
+  only:
+    - main
+  variables:
+    BUILD: 'yarn build'
+    ENVIRONMENT: 'prod'
+  artifacts:
+    paths:
+      - $BUILD_ARTIFACT
+  needs:
+    - terraform:apply:prod
+    - yarn-install
+
+.sentry_release:
+  stage: build-v1
+  needs:
+    - .build-application
+  image: getsentry/sentry-cli
+  script:
+    - echo "Creating new Sentry release ${CI_COMMIT_SHORT_SHA}"
+    - sentry-cli releases -o $SENTRY_ORG new -p $SENTRY_PROJECT $CI_COMMIT_SHORT_SHA
+    - $UPLOAD_SOURCEMAPS
+    - sentry-cli releases finalize $CI_COMMIT_SHORT_SHA
+    - echo "Finalized release ${CI_COMMIT_SHORT_SHA}"
+
+sentry_release:mr:
+  stage: build-v1
+  extends:
+    - .sentry_release
+  needs:
+    - build-application:mr
+  only:
+    - merge_requests
+  variables:
+    UPLOAD_SOURCEMAPS: >
+      sentry-cli sourcemaps upload
+      --release $CI_COMMIT_SHORT_SHA
+      --url-prefix "~/$CI_MERGE_REQUEST_ID"
+      $CI_PROJECT_DIR/$BUILD_ARTIFACT
+
+sentry_release:qa:
+  stage: build-v1
+  extends:
+    - .sentry_release
+  only:
+    - main
+  needs:
+    - build-application:qa
+  variables:
+    UPLOAD_SOURCEMAPS: >
+      sentry-cli sourcemaps upload
+      --release $CI_COMMIT_SHORT_SHA
+      --url-prefix "~/"
+      $CI_PROJECT_DIR/$BUILD_ARTIFACT
+
+sentry_release:prod:
+  stage: build-v1
+  extends:
+    - .sentry_release
+  only:
+    - main
+  needs:
+    - build-application:prod
+  variables:
+    UPLOAD_SOURCEMAPS: >
+      sentry-cli sourcemaps upload
+      --release $CI_COMMIT_SHORT_SHA
+      --url-prefix "~/"
+      $CI_PROJECT_DIR/$BUILD_ARTIFACT
+
+#############
+## Tests
+##
+
+lint:
+  stage: test
+  needs:
+    - yarn-install
+  only:
+    - merge_requests
+  extends:
+    - .orgrunner-neutral-large
+  script:
+    - yarn lint-check
+  cache:
+    - <<: *node_modules-cache
+
+unit-tests:
+  stage: test
+  needs:
+    - yarn-install
+  image: $WEBAPP_ENV_IMAGE
+  extends:
+    - .orgrunner-neutral-large
+  before_script:
+    - curl -o- -L https://yarnpkg.com/install.sh | bash
+    - export PATH="$HOME/.yarn/bin:$HOME/.config/yarn/global/node_modules/.bin:$PATH"
+    - cat src/environments/environment.dynamic.ts > src/environments/environment.ts
+  only:
+    - merge_requests
+  script:
+    - yarn test-headless
+  cache:
+    - <<: *node_modules-cache
+    - <<: *angular-cache
+
+#############
+## Deploy
+##
+
+.aws_development:
+  stage: deploy
+  image: registry.gitlab.com/org/products/tandm/basecamp/cloud/aws-npm-terraform/tf-1.0.5-main:latest
+  before_script:
+    - echo "[default]" >> ~/.aws/credentials
+    - echo "aws_access_key_id=${AWS_CLoudOps_SAAS_development_AccessKey}" >> ~/.aws/credentials
+    - echo "aws_secret_access_key=${AWS_CLoudOps_SAAS_development_SecretKey}" >> ~/.aws/credentials
+
+.aws_production_creds:
+  stage: deploy
+  image: registry.gitlab.com/org/products/tandm/basecamp/cloud/aws-npm-terraform/tf-1.0.5-main:latest
+  before_script:
+    - echo "[default]" >> ~/.aws/credentials
+    - echo "aws_access_key_id=${AWS_CLoudOps_SAAS_production_AccessKey}" >> ~/.aws/credentials
+    - echo "aws_secret_access_key=${AWS_CLoudOps_SAAS_production_SecretKey}" >> ~/.aws/credentials
+
+.s3_sync:
+  stage: deploy
+  image: registry.gitlab.com/org/products/tandm/basecamp/cloud/aws-npm-terraform/tf-1.0.5-main:latest
+  script:
+    - export $(cat ./deploy.env | xargs)
+    - rm $CI_PROJECT_DIR/$BUILD_ARTIFACT/*.map
+    - aws s3 sync ${BUILD_ARTIFACT} ${WEB_BUCKET_PATH} --size-only --exact-timestamps --delete
+    - echo "ENV_URL=https://${WEB_DOMAIN}${END_URL}" >> ${CI_PROJECT_DIR}/deploy2.env
+
+.cloudfront-create-invalidation:
+  stage: deploy
+  image: registry.gitlab.com/org/products/tandm/basecamp/cloud/aws-npm-terraform/tf-1.0.5-main:latest
+  retry: 2
+  script:
+    - export $(cat ./deploy.env | xargs)
+    - aws cloudfront create-invalidation --distribution-id ${DISTRIBUTION_ID} --paths "/*"
+    - echo "ENV_URL=https://${WEB_DOMAIN}${END_URL}" >> ${CI_PROJECT_DIR}/deploy2.env
+
+s3:sync:mr:
+  only:
+    - merge_requests
+  extends:
+    - .aws_development
+    - .s3_sync
+  variables:
+    WEB_BUCKET_NAME: 'web-merreqenvir756'
+    WEB_BUCKET_PATH: 's3://${WEB_BUCKET_NAME}/tms-webui/$CI_MERGE_REQUEST_ID'
+    END_URL: '/$CI_MERGE_REQUEST_ID/index.html'
+  artifacts:
+    reports:
+      dotenv: deploy2.env
+    paths:
+      - deploy.env
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    url: $ENV_URL
+    on_stop: mr-stop-environment
+  needs:
+    - terraform:apply:mr
+    - build-application:mr
+
+cloudfront-create-invalidation:mr:
+  only:
+    - merge_requests
+  extends:
+    - .aws_development
+    - .cloudfront-create-invalidation
+  variables:
+    END_URL: '/$CI_MERGE_REQUEST_ID/index.html'
+  artifacts:
+    reports:
+      dotenv: deploy2.env
+    paths:
+      - deploy.env
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    url: $ENV_URL
+    on_stop: mr-stop-environment
+  needs:
+    - s3:sync:mr
+
+mr-stop-environment:
+  stage: deploy
+  image: registry.gitlab.com/org/products/tandm/basecamp/cloud/aws-npm-terraform/tf-1.0.5-main:latest
+  only:
+    - merge_requests
+  variables:
+    GIT_STRATEGY: none
+    WEB_BUCKET_NAME: 'web-merreqenvir756'
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    action: stop
+  extends:
+    - .aws_development
+  script:
+    - echo "Remove review app"
+    - aws s3 rm --recursive s3://${WEB_BUCKET_NAME}/tms-webui/$CI_MERGE_REQUEST_ID
+  when: manual
+
+s3:sync:qa:
+  only:
+    - main
+  resource_group: qa
+  extends:
+    - .aws_development
+    - .s3_sync
+    - .orgrunner-qa
+  variables:
+    WEB_BUCKET_PATH: 's3://qa2-orgexchange-web'
+    END_URL: '/index.html'
+  artifacts:
+    reports:
+      dotenv: deploy2.env
+    paths:
+      - deploy.env
+  environment:
+    name: qa
+    url: $ENV_URL
+  needs:
+    - terraform:apply:qa
+    - build-application:qa
+
+cloudfront-create-invalidation:qa:
+  only:
+    - main
+  extends:
+    - .aws_development
+    - .cloudfront-create-invalidation
+    - .orgrunner-qa
+  variables:
+    END_URL: '/index.html'
+  environment:
+    name: qa
+    url: $ENV_URL
+  artifacts:
+    reports:
+      dotenv: deploy2.env
+    paths:
+      - deploy.env
+  needs:
+    - s3:sync:qa
+
+s3:sync:prod:
+  only:
+    - main
+  resource_group: prod
+  extends:
+    - .aws_production_creds
+    - .s3_sync
+    - .orgrunner-prod
+  variables:
+    WEB_BUCKET_PATH: 's3://prod-orgexchange-web'
+    END_URL: ''
+  artifacts:
+    reports:
+      dotenv: deploy2.env
+    paths:
+      - deploy.env
+  environment:
+    name: production
+    url: 'https://orgexchange.com'
+  needs:
+    - terraform:apply:prod
+    - build-application:prod
+
+cloudfront-create-invalidation:prod:
+  only:
+    - main
+  resource_group: prod
+  extends:
+    - .aws_production_creds
+    - .cloudfront-create-invalidation
+    - .orgrunner-prod
+  variables:
+    END_URL: ''
+  environment:
+    name: production
+    url: 'https://orgexchange.com'
+  artifacts:
+    reports:
+      dotenv: deploy2.env
+    paths:
+      - deploy.env
+  needs:
+    - s3:sync:prod
+
+semantic-versioning:
+  extends:
+    - .automatic:semantic:version
+  stage: deploy
+  only:
+    - main
+
+push:image:ECR:
+  stage: deploy
+  only:
+    - main
+  needs:
+    - container:create:build
+    - semantic-versioning
+  allow_failure: false
+  extends:
+    - .push:image:ECR
+
+push:image:ECR:mr:
+  stage: deploy
+  only:
+    - merge_requests
+  needs:
+    - container:create:build:mr
+    - build-container:mr
+  allow_failure: false
+  extends:
+    - .push:image:ECR

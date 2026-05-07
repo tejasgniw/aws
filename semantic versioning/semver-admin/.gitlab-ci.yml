@@ -1,0 +1,2170 @@
+##############################################################################
+# == CI/CD Pipeline ==========================================================
+# region preamble
+#####
+#
+# This files describe the lifecycle pipeline of our applications.
+#
+# Overview
+#   https://docs.gitlab.com/ee/ci/README.html
+#
+# Keyword reference
+#   https://docs.gitlab.com/ee/ci/yaml/README.html
+#
+# Predefined variables reference:
+#   https://docs.gitlab.com/ee/ci/variables/predefined_variables.html
+#
+# Environments
+#   https://docs.gitlab.com/ee/ci/environments/
+#
+###
+
+###
+# -- Global configurations
+#
+#
+
+variables:
+  APP_VERSION: 0.1.0
+  SECURITY_SCAN_COMPONENT_GROUP: "Exchange"
+
+stages:
+  - janitor
+  - freeze
+  - build
+  - publish
+  - test
+  - report
+  - release
+  - semver-release
+  - notification
+  - post-release
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      # Never run a 'branch' pipeline where this branch is under MRs.
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == "$CI_DEFAULT_BRANCH"
+      # Do run pipelines for schedules on the default branch
+      when: always
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      # Do run detached MR pipelines
+      when: always
+    - if: $CI_COMMIT_BRANCH
+      # Do run manually triggered pipelines
+      when: always
+
+#
+###
+
+###
+# -- Global templates
+#
+.large-template:
+  variables:
+    KUBERNETES_CPU_REQUEST: 1000m
+    KUBERNETES_CPU_LIMIT: 1200m
+    KUBERNETES_MEMORY_REQUEST: 2500Mi
+    KUBERNETES_MEMORY_LIMIT: 2500Mi
+
+# Setup python for tools
+.pypackages-template:
+  image: public.ecr.aws/docker/library/python:3.11
+  before_script:
+    # Add timestamp to logs for debugging problem with containers dying
+    - echo "UTC Timestamp"
+    - date '+%Y-%m-%dT%H:%M:%S:%3NZ'
+    - python -m venv .venv
+    - source .venv/bin/activate
+    - echo -e "machine gitlab.com\nlogin gitlab-ci-token\npassword ${CI_JOB_TOKEN}" > ~/.netrc
+    - pip install --extra-index-url https://gitlab.com/api/v4/projects/48897778/packages/pypi/simple -U pip==25.0.1 setuptools -e '.[build_system]'
+
+.release-template:
+  stage: release
+
+# Pick our own Kubernetes runner
+.neutral-orgrunner:
+  tags:
+    - vpc-neutral
+
+.qa-orgrunner:
+  tags:
+    - vpc-qa
+
+.prod-orgrunner:
+  tags:
+    - vpc-prod
+
+.infra-pypackages-template:
+  image: public.ecr.aws/docker/library/python:3.11
+  before_script:
+    # Add timestamp to logs for debugging problem with containers dying
+    - echo "UTC Timestamp"
+    - date '+%Y-%m-%dT%H:%M:%S:%3NZ'
+    - python -m venv .venv
+    - source .venv/bin/activate
+    - pip install -U pip setuptools -e ./tool -e ./infra
+
+.infrastructure-deploy:
+  before_script:
+    # Add timestamp to logs for debugging problem with containers dying
+    - echo "UTC Timestamp"
+    - date '+%Y-%m-%dT%H:%M:%S:%3NZ'
+    # Read the version number
+    - export VERSION="$(cat VERSION | xargs)"
+    # Setup GCP service account key for deployement
+    - echo "${GOOGLE_APPLICATION_CREDENTIALS_CONTENT}" > $GOOGLE_APPLICATION_CREDENTIALS
+    # Make the creds path absolute
+    - export GOOGLE_APPLICATION_CREDENTIALS="$(cd "$(dirname "$GOOGLE_APPLICATION_CREDENTIALS")"; pwd -P)/$(basename "$GOOGLE_APPLICATION_CREDENTIALS")"
+    # Pulumi expects a virtual environment.  It could create it itself, but we
+    # prefer to have more control and thus get better feedbacks in case something
+    # goes wrong.
+    - python -m venv .venv
+    # Install the tool and Pulumi within the venv manually to only have to
+    # activate it once. Otherwise, Pulumi require to reload it.
+    - export VIRTUAL_ENV="$(pwd)/.venv"
+    - ./.venv/bin/pip install -U pip setuptools -e ./tool -e ./infra
+    - ./.venv/bin/tool -vv infra pulumi-install --home ./.venv
+    - source .venv/bin/activate
+    - curl -O https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-406.0.0-linux-x86_64.tar.gz
+    - tar -xf google-cloud-cli-406.0.0-linux-x86_64.tar.gz
+    - ./google-cloud-sdk/install.sh --quiet
+    - ./google-cloud-sdk/bin/gcloud auth login --cred-file $GOOGLE_APPLICATION_CREDENTIALS
+    - ./google-cloud-sdk/bin/gcloud config set project $GOOGLE_PROJECT
+    - export GOOGLE_CLOUD_ACCESS_TOKEN="$(./google-cloud-sdk/bin/gcloud auth application-default print-access-token)"
+
+.python-test-deploy:
+  before_script:
+    # Add timestamp to logs for debugging problem with containers dying
+    - echo "UTC Timestamp"
+    - date '+%Y-%m-%dT%H:%M:%S:%3NZ'
+    # Setup GCP service account key for deployement
+    - echo "${GOOGLE_APPLICATION_CREDENTIALS_CONTENT}" > $GOOGLE_APPLICATION_CREDENTIALS
+    # Make the creds path absolute
+    - export GOOGLE_APPLICATION_CREDENTIALS="$(cd "$(dirname "$GOOGLE_APPLICATION_CREDENTIALS")"; pwd -P)/$(basename "$GOOGLE_APPLICATION_CREDENTIALS")"
+    # Pulumi expects a virtual environment.  It could create it itself, but we
+    # prefer to have more control and thus better feedbacks in case something
+    # goes wrong.
+    - python -m venv .venv
+    - source .venv/bin/activate
+    # Install the tool and Pulumi within the venv.
+    - pip install -U pip setuptools -e ./tool -e ./infra
+
+.mongo-replica-set-init:
+  before_script:
+    - curl -fsSL https://pgp.mongodb.com/server-6.0.asc | gpg --dearmor | tee /usr/share/keyrings/mongodb-server-6.0.gpg > /dev/null
+    - echo "deb [arch=amd64 signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg] https://repo.mongodb.org/apt/debian bullseye/mongodb-org/6.0 main" | tee /etc/apt/sources.list.d/mongodb-org-6.0.list
+    - apt-get update && apt-get install -y mongodb-mongosh
+    - |
+      until mongosh --host mongo --port 27017 --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
+        echo "Waiting for MongoDB...";
+        sleep 2;
+      done
+    - echo "MongoDB is ready!"
+    - |
+      mongosh --host mongo --port 27017 --quiet --eval "
+          try {
+            rs.status()
+          } catch (err) {
+            rs.initiate({
+              _id: 'rs0',
+              members: [{ _id: 0, host: 'mongo:27017' }]
+            })
+          }
+        "
+    - echo "Replica set initialized!"
+  services:
+    - name: mongo:5.0.24
+      alias: mongo
+      command:
+        ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
+
+#
+###
+
+#####
+# endregion
+##############################################################################
+
+##############################################################################
+# -- STAGE: clean the kitchen ------------------------------------------------
+# region janitor
+#####
+#
+# Reference: https://pyup.readthedocs.io/en/latest/
+#
+.fix-pulumi-stack:
+  extends:
+    - .test-template
+  image: public.ecr.aws/docker/library/python:3.11
+  when: manual
+  before_script:
+    # Setup tool and pulumi
+    - python -m venv .venv
+    - source .venv/bin/activate
+    - pip install -U pip setuptools -e ./tool -e ./infra
+    - tool -vv infra pulumi-install
+    - pulumi version
+    - pulumi login $PULUMI_BACKEND_URL
+    - pulumi whoami -v
+    # Run fix
+    - pulumi stack select $PULUMI_STACK_NAME
+    - pulumi stack export > stack.json
+    - cat stack.json
+    - python3 scripts/pulumi_state_file_fixer/fix_pulumi_state_file.py
+    - pulumi stack import --file stack.json
+
+#####
+# endregion
+##############################################################################
+
+##############################################################################
+# -- STAGE: freeze -----------------------------------------------------------
+# region freeze
+#####
+#
+# Freeze the code and dependencies and archive everything as artifacts
+#
+.freeze-template:
+  extends:
+    - .neutral-orgrunner
+  stage: freeze
+  needs: []
+  rules:
+    # Always run except on schedules
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: on_success
+
+# Must enter IMAGE_TAG manually. Example: V1.1
+setup-dev-container-image-version:static-version:
+  extends:
+    - .neutral-orgrunner
+  stage: janitor
+  script:
+    - echo "IMAGE_TAG = '$IMAGE_TAG'"
+    - if [ -z $IMAGE_TAG ]; then
+      echo "IMAGE_TAG env variable must be set. Set the value manually and re-run the job. Exiting...";
+      exit 1;
+      fi
+    - touch tag.env
+    - echo "IMAGE_TAG=${IMAGE_TAG}" > tag.env
+  artifacts:
+    name: "$CI_COMMIT_REF_NAME-dev-container-tag"
+    paths:
+      - tag.env
+  when: manual
+
+# Build dev-container image for each platform (amd64 and arm64)
+# The images will be pushed to IMAGE_TAG-dev for amd64 and IMAGE_TAG-dev-arm64 for arm64
+build-dev-container-image:static-version:
+  stage: janitor
+  needs:
+    - setup-dev-container-image-version:static-version
+  extends:
+    - .large-template
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - export $(cat ./tag.env | xargs)
+    - DESTINATION="$CI_REGISTRY_IMAGE/exchange-admin-env:$IMAGE_TAG-$TAG"
+    - echo "DESTINATION = $DESTINATION"
+    - cd container/dev-container
+    - >
+      /kaniko/executor --destination "$DESTINATION" \
+        --context "${CI_PROJECT_DIR}" \
+        --dockerfile "Dockerfile" \
+        --snapshot-mode=redo \
+        --custom-platform=$CUSTOMPLATFORM
+  parallel:
+    matrix:
+      - ARCHTAG: neutral
+        TAG: dev
+        CUSTOMPLATFORM: linux/amd64
+      - ARCHTAG: neutral-arm64
+        TAG: dev-arm64
+        CUSTOMPLATFORM: linux/arm64
+  when: on_success
+  tags:
+    - vpc-${ARCHTAG}
+
+build_admin_requirements:
+  extends:
+    - .neutral-orgrunner
+    - .freeze-template
+    - .pypackages-template
+  script:
+    - make requirements
+  artifacts:
+    name: "$CI_COMMIT_REF_NAME-requirements"
+    paths:
+      - requirements.txt
+      - src/basecamp/gcp/requirements.txt
+
+build_admin_dist_package:
+  extends:
+    - .neutral-orgrunner
+    - .freeze-template
+    - .pypackages-template
+  script:
+    - make sdist-tgz
+  artifacts:
+    name: "$CI_COMMIT_REF_NAME-sdist_tgz"
+    paths:
+      - dist/*.tar.gz
+
+build_legacy_dist:
+  image: public.ecr.aws/docker/library/node:20
+  extends:
+    - .neutral-orgrunner
+    - .freeze-template
+  variables:
+    # Gitlab Pipeline behavior
+    CI_DEBUG_TRACE: "false"
+  script:
+    - cd legacy
+    - node --version
+    - cp .npmrc.pipeline .npmrc
+    - yarn install --frozen-lockfile
+    - yarn build:prod
+  artifacts:
+    name: "$CI_COMMIT_REF_NAME-legacy_dist"
+    paths:
+      - legacy/dist
+      - legacy/node_modules
+#####
+# endregion
+##############################################################################
+
+##############################################################################
+# -- STAGE: build ------------------------------------------------------------
+# region build
+#####
+#
+# Build production and tooling distributions
+#
+.build-template:
+  stage: build
+  rules:
+    # Always run except on schedules
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - when: on_success
+  extends:
+    - .neutral-orgrunner
+
+.buildpy-template:
+  extends:
+    - .pypackages-template
+    - .build-template
+
+# Generate dependency tree JSON in the same directory as requirements.txt (for security scans/ dependency scanning)
+build_pip_dependency_tree:
+  extends:
+    - .buildpy-template
+  needs:
+    - build_admin_dist_package
+    - build_admin_requirements
+  dependencies:
+    - build_admin_requirements
+  script:
+    - pip install -r requirements.txt
+    - pip install pipdeptree
+    - pipdeptree -e pipdeptree --json > pipdeptree.json
+  artifacts:
+    when: on_success
+    paths:
+      - pipdeptree.json
+
+# GCIP Cloud Function archive
+##FIXME install tool template and use it for gcip
+gcip_zip:
+  extends:
+    - .infra-pypackages-template
+    - .build-template
+  script:
+    - tool -vv build googlecloudbeforecreatefuncdist
+  artifacts:
+    name: "$CI_COMMIT_REF_NAME-gcip_zip"
+    paths:
+      - dist/*.zip
+
+.openapi-base:
+  image: public.ecr.aws/docker/library/node:20
+  extends: .build-template
+  before_script:
+    - curl https://pyenv.run | bash
+    - /root/.pyenv/bin/pyenv install 3.11.10
+    - /root/.pyenv/versions/3.11.10/bin/python3.11 -m venv .venv
+    - source .venv/bin/activate
+    - echo -e "machine gitlab.com\nlogin gitlab-ci-token\npassword ${CI_JOB_TOKEN}" > ~/.netrc
+    - pip install --extra-index-url https://gitlab.com/api/v4/projects/48897778/packages/pypi/simple -U -e .
+  needs:
+    - build_legacy_dist
+  dependencies:
+    - build_legacy_dist
+
+# Publish our OpenAPIv3 spec
+
+openapi:
+  extends: .openapi-base
+  script:
+    - make openapi
+  artifacts:
+    name: "$CI_COMMIT_REF_NAME-openapi"
+    paths:
+      - build/openapi/openapi.yml
+
+openapi_public:
+  extends: .openapi-base
+  variables:
+    PUBLIC_OPENAPI_SPEC: true
+  script:
+    - make openapi-public
+  artifacts:
+    name: "$CI_COMMIT_REF_NAME-openapi"
+    paths:
+      - build/openapi/openapi_public.yml
+
+###
+# -- Jobs for building container images
+.container-creds:
+  extends:
+    - .build-template
+    - .neutral-orgrunner
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - userinfo="$(printf "%s:%s" "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')"
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$userinfo\"}}}" > /kaniko/.docker/config.json
+    - echo -e "machine gitlab.com\nlogin gitlab-ci-token\npassword ${CI_JOB_TOKEN}" > .netrc
+    # Setup GCP service account key used by the Firebase Admin SDK
+    # this is included in the docker image.
+    - echo "${GOOGLE_APPLICATION_CREDENTIALS_ADMINSDK_CONTENT}" > ./adminsdk-credentials.json
+
+# Build the application container
+# build latest image for qa and prod stacks only
+.container:build:
+  extends:
+    - .container-creds
+  script:
+    - export VERSION="$(cat VERSION | xargs)"
+    - |
+      if [ "$STACK" = "qa" ] || [ "$STACK" = "prod" ]; then
+        export EXTRA_DEST="--destination $CI_REGISTRY_IMAGE/$CONTAINERNAME:$STACK-latest"
+      else
+        export EXTRA_DEST=""
+      fi
+    - >
+      /kaniko/executor --destination $CI_REGISTRY_IMAGE/$CONTAINERNAME:$STACK-$CI_COMMIT_SHA $EXTRA_DEST \
+        --context $CI_PROJECT_DIR \
+        --build-arg VERSION=$VERSION \
+        --dockerfile $CI_PROJECT_DIR/container/$CONTAINERNAME/Dockerfile \
+        --snapshotMode=redo
+
+container:build:python:services:mr:
+  extends:
+    - .container:build
+    - .large-template
+  variables:
+    GOOGLE_APPLICATION_CREDENTIALS_ADMINSDK_CONTENT: $VAR_GOOGLE_APPLICATION_CREDENTIALS_ADMINSDK_MR
+    STACK: $CI_MERGE_REQUEST_IID
+    CONTAINERNAME: python-services
+  rules:
+    # Only on branches and never on schedule
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: on_success
+  needs:
+    - build_admin_dist_package
+    - build_admin_requirements
+  dependencies:
+    - build_admin_dist_package
+    - build_admin_requirements
+
+container:build:python:services:qa:
+  extends:
+    - .container:build
+  variables:
+    GOOGLE_APPLICATION_CREDENTIALS_ADMINSDK_CONTENT: $VAR_GOOGLE_APPLICATION_CREDENTIALS_ADMINSDK_DEVELOPMENT
+    STACK: qa
+    CONTAINERNAME: python-services
+  rules:
+    # Only run after a merge on default branch
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - when: on_success
+  needs:
+    - build_admin_dist_package
+    - build_admin_requirements
+  dependencies:
+    - build_admin_dist_package
+    - build_admin_requirements
+
+container:build:python:services:prod:
+  extends:
+    - .container:build
+  variables:
+    GOOGLE_APPLICATION_CREDENTIALS_ADMINSDK_CONTENT: $VAR_GOOGLE_APPLICATION_CREDENTIALS_ADMINSDK_EXPLOITATION
+    STACK: prod
+    CONTAINERNAME: python-services
+  rules:
+    # Only run after a merge on default branch
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - when: on_success
+  needs:
+    - build_admin_dist_package
+    - build_admin_requirements
+  dependencies:
+    - build_admin_dist_package
+    - build_admin_requirements
+
+#####
+# endregion
+##############################################################################
+
+##############################################################################
+# -- STAGE: test -------------------------------------------------------------
+# region test
+#####
+
+###################################
+# -- Important Notes --------------
+#####
+#
+# It is important to use localhost as host when testing anything with services
+# since we currently run our tests in Kubernetes (k8s).
+#
+# Explanation:
+#
+# - The kubernetes executor will create a pod runner.
+# - All your containers will start in the same pod with only one IP address.
+# - Network between containers in the same pod is done by contacting 127.0.0.1.
+# - If you want to contact the postgres container you'll likely want to contact
+#   127.0.0.1:5432.
+# - So if you use 127.0.0.1 instead of postgres it should work.
+#
+# The docker executor work pretty much like a docker-compose upping all your
+# containers in the same network. Each container get an IP and a DNS is
+# created:
+#
+#   If your service is named postgres the command nc postgres will resolve the
+#   postgres container IP and contact it (172.17.0.15:5432 for example).
+#
+# Explanation taken from https://stackoverflow.com/a/54116964/3900435.
+
+.test-template:
+  extends:
+    - .neutral-orgrunner
+  stage: test
+  rules:
+    # Always run except on schedules
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: on_success
+
+###
+# -- Security and compliance jobs
+#
+
+include:
+  - local: .gitlab/ci/security/security.gitlab-ci.yml
+    rules:
+      - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+        when: always
+      - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+        when: always
+      - when: never
+
+#
+###
+
+###
+# -- Automated testing
+.install-testing:
+  image: public.ecr.aws/docker/library/python:3.11
+  before_script:
+    # Add timestamp to logs for debugging problem with containers dying
+    - echo "UTC Timestamp"
+    - date '+%Y-%m-%dT%H:%M:%S:%3NZ'
+    - python -m venv .venv
+    - source .venv/bin/activate
+    - echo -e "machine gitlab.com\nlogin gitlab-ci-token\npassword ${CI_JOB_TOKEN}" > ~/.netrc
+    - pip install --extra-index-url https://gitlab.com/api/v4/projects/48897778/packages/pypi/simple -U pip setuptools -e '.[testing]'
+
+.pytest-template:
+  extends:
+    - .test-template
+    - .install-testing
+  needs: []
+
+# Unit tests
+pytest_unit:
+  extends:
+    - .pytest-template
+    - .test-template
+    - .neutral-orgrunner
+  variables:
+    OTEL_SDK_DISABLED: "true"
+  script:
+    - make unit-test
+  image: $IMAGE
+  artifacts:
+    when: always
+    paths:
+      - build/report/coverage*
+    reports:
+      junit: build/report/pytest_junit.xml
+  parallel:
+    matrix:
+      - IMAGE:
+          - public.ecr.aws/docker/library/python:3.11
+
+# Tests against actual running MongoDB and PostgreSQL instances
+pytest_integration:
+  extends:
+    - .pytest-template
+    - .test-template
+    - .neutral-orgrunner
+  variables:
+    # Gitlab Pipeline behavior
+    CI_DEBUG_TRACE: "false"
+    DEVICE_VERIFICATION_URI: http://localhost:4200/activate
+    # PostgreSQL config
+    SQL_SCHEME: postgresql+asyncpg
+    SQL_HOST: localhost
+    SQL_PORT: 5432
+    SQL_USERNAME: root
+    SQL_PASSWORD: toor
+    SQL_DBNAME: basecamp
+    # Variables used by Gitlab CI Services for PostgreSQL
+    POSTGRES_DB: $SQL_DBNAME
+    POSTGRES_USER: $SQL_USERNAME
+    POSTGRES_PASSWORD: $SQL_PASSWORD
+    POSTGRES_HOST_AUTH_METHOD: trust
+    # AWS Localstack variables
+    AWS_ACCESS_KEY_ID: dummy
+    AWS_SECRET_ACCESS_KEY: dummy
+    AWS_DEFAULT_REGION: us-east-1
+    AWS_ENDPOINT: http://localhost:4566
+    ATTACHMENTS_BUCKET: exchange-attachments
+    SUBSCRIPTION_SERVICE_URL: exchange-subscription
+    EXPORT_BUCKET: exchange-exports
+    OTEL_SDK_DISABLED: "true"
+  script:
+    - pip install awscli
+    - chmod +x localSetup.sh
+    - ./localSetup.sh
+    - pip install docutils==0.18 # awscli downgrate this package version
+    - make integration-test
+  image: public.ecr.aws/docker/library/python:3.11
+  artifacts:
+    when: always
+    paths:
+      - build/report/coverage*
+    reports:
+      junit: build/report/pytest_junit.xml
+  services:
+    - public.ecr.aws/docker/library/postgres:13.2
+    - public.ecr.aws/localstack/localstack:1.4.0
+
+# Tests our HTTP endpoint against a running instance of the app
+pytest_functional_http:
+  extends:
+    - .pytest-template
+    - .neutral-orgrunner
+    - .large-template
+  variables:
+    NAME: "admin"
+    # AWS Localstack variables
+    AWS_ACCESS_KEY_ID: dummy
+    AWS_SECRET_ACCESS_KEY: dummy
+    AWS_DEFAULT_REGION: us-east-1
+    AWS_ENDPOINT: http://localhost:4566
+    ATTACHMENTS_BUCKET: exchange-attachments
+    EXPORT_BUCKET: exchange-exports
+    MESSAGE_BACKUPS_BUCKET: backups_bucket
+    ACTIVITY_LOGS_BUCKET: exchange-activity-logs
+    MEASUREMENT_URL: http://localhost:3000
+    WORKFLOW_URL: http://localhost:3000
+    ATTACHMENT_URL: http://localhost
+    SUBSCRIPTION_SERVICE_URL: http://localhost
+    PERMISSION_URL: http://localhost
+    LIVE_API_HOST: localhost
+    LIVE_API_URL: http://$LIVE_API_HOST
+    # Gitlab Pipeline behavior
+    CI_DEBUG_TRACE: "false"
+    # Application and test configuration
+    GCIP_TENANT_NAME: yeetenant
+    GCIP_FIREBASE_API_KEY: foo
+    ROUTERS: '["workspace", "notification", "user", "collaborator", "device", "permission", "attachment", "properties", "comment", "export", "auth", "inventory", "healthz"]'
+    CORS_ORIGINS: '["*"]'
+    CORS_METHODS: '["*"]'
+    CORS_HEADERS: '["*","authorization"]'
+    CORS_EXPOSE_HEADERS: '["*"]'
+    LOG_LEVEL: debug
+    DEVICE_VERIFICATION_URI: http://localhost:4200/activate
+    # PostgreSQL config
+    SQL_SCHEME: postgresql+asyncpg
+    SQL_HOST: localhost
+    SQL_PORT: 5432
+    SQL_USERNAME: root
+    SQL_PASSWORD: toor
+    SQL_DBNAME: basecamp
+    # Variables used by Gitlab CI Services for PostgreSQL
+    POSTGRES_DB: $SQL_DBNAME
+    POSTGRES_USER: $SQL_USERNAME
+    POSTGRES_PASSWORD: $SQL_PASSWORD
+    POSTGRES_HOST_AUTH_METHOD: trust
+    # Sendgrid config
+    SENDGRID_API_KEY: "fooapikey"
+    SENDGRID_INVITATION_TEMPLATE_ID: "footemplateid"
+    SENDGRID_JOB_STATUS_UPDATE_TEMPLATE_ID: "feetemplateid"
+    SENDGRID_NOREPLY_EMAIL: "foo@fou.com"
+    EXCHANGE_WEB_URL: https://exchange.net
+    IS_LOCAL: true
+    OTEL_SDK_DISABLED: "true"
+  script:
+    - pip install awscli
+    - chmod +x localSetup.sh
+    - ./localSetup.sh
+    - pip install docutils==0.18 # awscli downgrate this package version
+    - make migrate-db
+    - make functional-test-http
+  image: public.ecr.aws/docker/library/python:3.11
+  artifacts:
+    when: always
+    paths:
+      - build/report/coverage*
+    reports:
+      junit: build/report/pytest_junit.xml
+  services:
+    - $CI_REGISTRY_IMAGE/python-services:$STACK-$CI_COMMIT_SHA
+    - public.ecr.aws/docker/library/postgres:13.2
+    - public.ecr.aws/localstack/localstack:1.4.0
+  needs:
+    - job: container:build:python:services:mr
+      optional: true
+    - job: container:build:python:services:qa
+      optional: true
+  rules:
+    # Only on branches and never on schedule
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+      variables:
+        STACK: qa
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: on_success
+      variables:
+        STACK: $CI_MERGE_REQUEST_IID
+
+# Test message consumers agains a running instance of the app
+pytest_functional_consumers:
+  extends:
+    - .pytest-template
+    - .neutral-orgrunner
+  variables:
+    NAME: "admin"
+    # AWS Localstack variables
+    AWS_ACCESS_KEY_ID: dummy
+    AWS_SECRET_ACCESS_KEY: dummy
+    AWS_DEFAULT_REGION: us-east-1
+    AWS_ENDPOINT: http://localhost:4566
+    ATTACHMENTS_BUCKET: exchange-attachments
+    EXPORT_BUCKET: exchange-exports
+    MESSAGE_BACKUPS_BUCKET: backups_bucket
+    ACTIVITY_LOGS_BUCKET: exchange-activity-logs
+    MEASUREMENT_URL: http://localhost:3000
+    ATTACHMENT_URL: http://localhost
+    WORKFLOW_URL: http://localhost
+    SUBSCRIPTION_SERVICE_URL: http://localhost
+    PERMISSION_URL: http://localhost
+    LIVE_API_HOST: localhost
+    # Gitlab Pipeline behavior
+    CI_DEBUG_TRACE: "false"
+    # Application and test configuration
+    GCIP_TENANT_NAME: yeetenant
+    GCIP_FIREBASE_API_KEY: foo
+    ROUTERS: '["workspace", "notification", "user", "collaborator", "device", "permission", "attachment", "properties", "comment", "export", "auth", "inventory", "healthz"]'
+    CORS_ORIGINS: '["*"]'
+    CORS_METHODS: '["*"]'
+    CORS_HEADERS: '["*","authorization"]'
+    CORS_EXPOSE_HEADERS: '["*"]'
+    LOG_LEVEL: debug
+    DEVICE_VERIFICATION_URI: http://localhost:4200/activate
+    # PostgreSQL config
+    SQL_SCHEME: postgresql+asyncpg
+    SQL_HOST: localhost
+    SQL_PORT: 5432
+    SQL_USERNAME: root
+    SQL_PASSWORD: toor
+    SQL_DBNAME: basecamp
+    # Variables used by Gitlab CI Services for PostgreSQL
+    POSTGRES_DB: $SQL_DBNAME
+    POSTGRES_USER: $SQL_USERNAME
+    POSTGRES_PASSWORD: $SQL_PASSWORD
+    POSTGRES_HOST_AUTH_METHOD: trust
+    # Broker config
+    MESSAGE_BROKER_HOST: localhost
+    MESSAGE_BROKER_USER: guest
+    MESSAGE_BROKER_PASSWORD: guest
+    MESSAGE_BROKER_PORT: 5672
+    # Sendgrid config
+    SENDGRID_API_KEY: "fooapikey"
+    SENDGRID_INVITATION_TEMPLATE_ID: "footemplateid"
+    SENDGRID_JOB_STATUS_UPDATE_TEMPLATE_ID: "feetemplateid"
+    SENDGRID_NOREPLY_EMAIL: "foo@fou.com"
+    EXCHANGE_WEB_URL: https://exchange.net
+    # Test setup
+    ADMIN_LIVE_URL: http://localhost:80
+    ATTACHMENT_LIVE_URL: http://localhost:80
+    COMMENT_LIVE_URL: http://localhost:80
+    NOTIFICATION_LIVE_URL: http://localhost:80
+    IS_LOCAL: true
+    OTEL_SDK_DISABLED: "true"
+  script:
+    - pip install awscli
+    - chmod +x localSetup.sh
+    - ./localSetup.sh
+    - pip install docutils==0.18 # awscli downgrate this package version
+    - make migrate-db
+    - python3 infra/init_scripts/rabbitmq.py
+    - make functional-test-consumers
+  image: public.ecr.aws/docker/library/python:3.11
+  artifacts:
+    when: always
+    paths:
+      - build/report/coverage*
+    reports:
+      junit: build/report/pytest_junit.xml
+  services:
+    - $CI_REGISTRY_IMAGE/python-services:$STACK-$CI_COMMIT_SHA
+    - public.ecr.aws/docker/library/postgres:13.2
+    - public.ecr.aws/localstack/localstack:1.4.0
+    - public.ecr.aws/docker/library/rabbitmq:3-alpine
+  needs:
+    - job: container:build:python:services:mr
+      optional: true
+    - job: container:build:python:services:qa
+      optional: true
+  rules:
+    # Only on branches and never on schedule
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+      variables:
+        STACK: qa
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: on_success
+      variables:
+        STACK: $CI_MERGE_REQUEST_IID
+
+###
+# This job Creates a new Pulumi stack (named with the branch name) and
+# deploys it. This allows us to test our pulumi scripts
+#
+# It creates a GitLab environment, which is stopped by the
+# stop_pytest_merge_request_environment job.
+test_pulumi_mr_environment:
+  extends:
+    - .test-template
+    - .infrastructure-deploy
+    - .qa-orgrunner
+  image: public.ecr.aws/docker/library/python:3.11
+  when: manual
+  variables:
+    GOOGLE_APPLICATION_CREDENTIALS_CONTENT: $VAR_GOOGLE_APPLICATION_CREDENTIALS_DEPLOYBOT_DEVELOPMENT
+    GOOGLE_APPLICATION_CREDENTIALS: gcp_secret.json
+    # Variables for tool tests
+    GCIP_GOOGLEIDP_CLIENTID: 143993548817-66pa592d1uljv4a4i77spn6m6vt255hv.apps.googleusercontent.com
+    GCIP_GOOGLEIDP_CLIENTSECRET: p0qvrcg1tJhLX9npVwb7vTjF
+    GCIP_FIREBASE_API_KEY: $FIREBASE_MR_API_KEY
+    GOOGLE_PROJECT: orgapis-mr
+    GOOGLE_REGION: northamerica-northeast1
+    GCIP_PROJECT_ID: $GOOGLE_PROJECT
+    GCIP_REGION: $GOOGLE_REGION
+    CI_DEBUG_TRACE: "false"
+    # Variables for db migrations
+    SQL_SCHEME: postgresql+asyncpg
+    SQL_USERNAME: adminservices_write
+    SQL_PASSWORD: $Database_adminservices_write_QA
+    SQL_HOST: $ADMIN_DB_HOST_QA
+    SQL_PORT: 5432
+    SQL_DBNAME: adminservices
+    SQL_SCHEMA: mr${CI_MERGE_REQUEST_IID}
+  script:
+    - tool -vv infra deploy mr --no-dryrun
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    paths:
+      - deploy.env
+  environment:
+    name: deployment/$CI_COMMIT_REF_SLUG
+    deployment_tier: development
+    on_stop: stop_pytest_merge_request_environment
+  resource_group: $CI_MERGE_REQUEST_IID
+  needs:
+    - gcip_zip
+  rules:
+    # Only run during merge request
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: manual
+
+# Manual job to fix pulumi state file
+fix_pulumi_stack:mr:
+  extends:
+    - .fix-pulumi-stack
+    - .qa-orgrunner
+  image: public.ecr.aws/docker/library/python:3.11
+  when: manual
+  stage: test
+  variables:
+    ###
+    # Deployment credentials
+    ##
+    # AWS
+    AWS_ACCESS_KEY_ID: $AWS_CLoudOps_SAAS_development_AccessKey
+    AWS_SECRET_ACCESS_KEY: $AWS_CLoudOps_SAAS_development_SecretKey
+    # Pulumi
+    #   We don't end-to-end encrypt secrets. We could at some point.
+    PULUMI_CONFIG_PASSPHRASE: ""
+    PULUMI_STACK_NAME: $CI_MERGE_REQUEST_IID
+    PULUMI_BACKEND_URL: s3://org-cloudops-terraform-state-saas-qa/pulumi
+    AWS_DEFAULT_REGION: us-east-1
+  script:
+    - echo "Pulumi stack file fixed"
+  rules:
+    # Only run during merge request
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: manual
+
+legacy_unit_tests:
+  extends:
+    - .test-template
+    - .neutral-orgrunner
+  script:
+    - cd legacy
+    - yarn install
+    - yarn test:unit
+  image: public.ecr.aws/docker/library/node:20
+
+legacy_integration_tests:
+  extends:
+    - .test-template
+    - .large-template
+    - .neutral-orgrunner
+    - .mongo-replica-set-init
+  variables:
+    MONGO_SCHEME: mongodb
+    MONGO_HOST: mongo
+    MONGO_PORT: 27017
+    MONGO_CLIENT_OPTS: '{"retryWrites": true, "w": "majority"}'
+    MIGRATE_MONGO_URL: mongodb://mongo:27017
+    MONGO_WORKFLOW_DBNAME: workflow
+    MONGO_MEASUREMENT_DBNAME: measurement
+    MONGO_INITDB_DATABASE: measurement
+    LOG_LEVEL: debug
+    ROUTERS: '["workflow", "measurement"]'
+    CORS_ORIGINS: '["*"]'
+    CORS_EXPOSE_HEADERS: '["*"]'
+    # AWS Localstack variables
+    AWS_ACCESS_KEY_ID: dummy
+    AWS_SECRET_ACCESS_KEY: dummy
+    AWS_DEFAULT_REGION: us-east-1
+    AWS_ENDPOINT: http://localhost:4566
+  script:
+    - cd legacy
+    - yarn install
+    - yarn build:prod
+    - yarn migrate:up:all
+    - yarn test:integration
+  services:
+    - name: public.ecr.aws/localstack/localstack:1.4.0
+    - name: mongo:5.0.24
+      alias: mongo
+      command:
+        ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
+  image: public.ecr.aws/docker/library/node:20
+
+legacy_functional_tests:
+  extends:
+    - .test-template
+    - .large-template
+    - .neutral-orgrunner
+    - .mongo-replica-set-init
+  variables:
+    MONGO_SCHEME: mongodb
+    MONGO_HOST: mongo
+    MONGO_PORT: 27017
+    MONGO_CLIENT_OPTS: '{"retryWrites": true, "w": "majority"}'
+    MIGRATE_MONGO_URL: mongodb://mongo:27017
+    MONGO_WORKFLOW_DBNAME: workflow
+    MONGO_MEASUREMENT_DBNAME: measurement
+    MONGO_INITDB_DATABASE: measurement
+    LOG_LEVEL: debug
+    ROUTERS: '["workflow", "measurement"]'
+    CORS_ORIGINS: '["*"]'
+    CORS_EXPOSE_HEADERS: '["*"]'
+    MESSAGE_BROKER_HOST: localhost
+    MESSAGE_BROKER_USER: guest
+    MESSAGE_BROKER_PASSWORD: guest
+    MESSAGE_BROKER_PORT: 5672
+    ATT_ORGANIZATION_NAME: "10"
+    ATT_ORGANIZATION_NAME_BETA: "11"
+    att_oauth_client_id: foo
+    att_oauth_client_secret: bar
+    att_oauth_tenant_id: foobar
+    AWS_DEFAULT_REGION: us-east-1
+    AWS_ENDPOINT: http://localhost:4566
+    AWS_ACCESS_KEY_ID: foo
+    AWS_SECRET_ACCESS_KEY: bar
+  script:
+    - cd legacy
+    - yarn install
+    - yarn build:prod
+    - yarn migrate:up:all
+    - yarn test:functional
+  services:
+    - name: public.ecr.aws/docker/library/rabbitmq:3-alpine
+    - name: public.ecr.aws/localstack/localstack:1.4.0
+    - name: public.ecr.aws/docker/library/mongo:5.0.24
+      alias: mongo
+      command:
+        ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
+  image: public.ecr.aws/docker/library/node:20
+
+###
+# Stop the environment created in pytest_merge_request_environment.
+#
+# The rules below must be compatible with the one of defined in
+# stop_pytest_merge_request_environment.
+#
+# See also:
+#   https://docs.gitlab.com/ee/ci/environments/
+#   https://docs.gitlab.com/ee/ci/yaml/#environment
+stop_pytest_merge_request_environment:
+  image: public.ecr.aws/docker/library/python:3.11
+  variables:
+    ###
+    # Deployment credentials
+    #
+    # AWS
+    AWS_ACCESS_KEY_ID: $AWS_CLoudOps_SAAS_development_AccessKey
+    AWS_SECRET_ACCESS_KEY: $AWS_CLoudOps_SAAS_development_SecretKey
+    # GCP
+    GOOGLE_APPLICATION_CREDENTIALS_CONTENT: $VAR_GOOGLE_APPLICATION_CREDENTIALS_DEPLOYBOT_DEVELOPMENT
+    GOOGLE_APPLICATION_CREDENTIALS: gcp_secret.json
+    # Pulumi
+    #   We don't end-to-end encrypt secrets. We could at some point.
+    PULUMI_CONFIG_PASSPHRASE: ""
+    PULUMI_STACK_NAME: $CI_MERGE_REQUEST_IID
+    PULUMI_BACKEND_URL: s3://org-cloudops-terraform-state-saas-qa/pulumi
+    # Application and test configuration
+    #  These are both read by Pulumi in src/basecamp/infra/resource/config.py
+    #  and pytest in test/conftest.py
+    AWS_DEFAULT_REGION: us-east-1
+    GCIP_PROJECT_ID: orgapis-mr # We run MR pipelines with a specific project
+    GCIP_REGION: northamerica-northeast1 # Default region where Cloud Functions will be deployed
+    GOOGLE_PROJECT: orgapis-mr
+    SQL_SCHEME: postgresql+asyncpg
+    SQL_USERNAME: adminservices_write
+    SQL_PASSWORD: $Database_adminservices_write_QA
+    SQL_HOST: $ADMIN_DB_HOST_QA
+    SQL_PORT: 5432
+    SQL_DBNAME: adminservices
+    SQL_SCHEMA: mr${CI_MERGE_REQUEST_IID}
+    ###
+    # Parameters for SQL migrations with "The Tool"
+    TOOL_MIGRATION_POSTGRES_SCHEME: $SQL_SCHEME
+    TOOL_MIGRATION_POSTGRES_USERNAME: $SQL_USERNAME
+    TOOL_MIGRATION_POSTGRES_PASSWORD: $Database_adminservices_write_QA
+    TOOL_MIGRATION_POSTGRES_HOST: $SQL_HOST
+    TOOL_MIGRATION_POSTGRES_PORT: $SQL_PORT
+    TOOL_MIGRATION_POSTGRES_DBNAME: $SQL_DBNAME
+    TOOL_MIGRATION_POSTGRES_SCHEMA: MR${CI_MERGE_REQUEST_IID}
+  extends:
+    - .test-template
+    - .infrastructure-deploy
+    - .qa-orgrunner
+  environment:
+    name: deployment/$CI_COMMIT_REF_SLUG
+    action: stop
+  retry: 2
+  script:
+    # Clean up that mess, but do not fail doing so.
+    - tool -vv clean schema
+    - pulumi stack ls
+    - pulumi stack select $PULUMI_STACK_NAME
+    - pulumi refresh --yes
+    - pulumi destroy --yes || echo "Destroy failed"
+    - pulumi stack rm $PULUMI_STACK_NAME --yes || echo "Stack could not be removed"
+  rules:
+    # Run either (optionally) manually on a MR pipeline or triggered by on_stop.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: manual
+      allow_failure: true
+    - when: on_success
+      allow_failure: true
+
+###
+# Manually stop the environment created in pytest_merge_request_environment.
+#
+manually_stop_pytest_merge_request_environment:
+  image: public.ecr.aws/docker/library/python:3.11
+  when: manual
+  variables:
+    ###
+    # Deployment credentials
+    #
+    # AWS
+    AWS_ACCESS_KEY_ID: $AWS_CLoudOps_SAAS_development_AccessKey
+    AWS_SECRET_ACCESS_KEY: $AWS_CLoudOps_SAAS_development_SecretKey
+    # GCP
+    GOOGLE_APPLICATION_CREDENTIALS_CONTENT: $VAR_GOOGLE_APPLICATION_CREDENTIALS_DEPLOYBOT_DEVELOPMENT
+    GOOGLE_APPLICATION_CREDENTIALS: gcp_secret.json
+    # Pulumi
+    #   We don't end-to-end encrypt secrets. We could at some point.
+    PULUMI_CONFIG_PASSPHRASE: ""
+    PULUMI_STACK_NAME: CHANGE ME IN CI/CD
+    PULUMI_BACKEND_URL: s3://org-cloudops-terraform-state-saas-qa/pulumi
+    # Application and test configuration
+    #  These are both read by Pulumi in src/basecamp/infra/resource/config.py
+    #  and pytest in test/conftest.py
+    AWS_DEFAULT_REGION: us-east-1
+    GCIP_PROJECT_ID: orgapis-mr # We run MR pipelines with a specific project
+    GCIP_REGION: northamerica-northeast1 # Default region where Cloud Functions will be deployed
+    GOOGLE_PROJECT: orgapis-mr
+    SQL_SCHEME: postgresql+asyncpg
+    SQL_USERNAME: adminservices_write
+    SQL_PASSWORD: $Database_adminservices_write_QA
+    SQL_HOST: $ADMIN_DB_HOST_QA
+    SQL_PORT: 5432
+    SQL_DBNAME: adminservices
+    SQL_SCHEMA: mr${CI_MERGE_REQUEST_IID}
+    ###
+    # Parameters for SQL migrations with "The Tool"
+    TOOL_MIGRATION_POSTGRES_SCHEME: $SQL_SCHEME
+    TOOL_MIGRATION_POSTGRES_USERNAME: $SQL_USERNAME
+    TOOL_MIGRATION_POSTGRES_PASSWORD: $Database_adminservices_write_QA
+    TOOL_MIGRATION_POSTGRES_HOST: $SQL_HOST
+    TOOL_MIGRATION_POSTGRES_PORT: $SQL_PORT
+    TOOL_MIGRATION_POSTGRES_DBNAME: $SQL_DBNAME
+    TOOL_MIGRATION_POSTGRES_SCHEMA: mr${CI_MERGE_REQUEST_IID}
+  extends:
+    - .test-template
+    - .infrastructure-deploy
+    - .qa-orgrunner
+  environment:
+    name: deployment/$CI_COMMIT_REF_SLUG
+    action: stop
+  script:
+    # Clean up that mess, but do not fail doing so.
+    - tool -vv clean schema
+    - pulumi stack ls
+    - pulumi stack select $PULUMI_STACK_NAME
+    - pulumi refresh --yes
+    - pulumi destroy --yes || echo "Destroy failed"
+    - pulumi stack rm $PULUMI_STACK_NAME --yes || echo "Stack could not be removed"
+  rules:
+    # Run either (optionally) manually on a MR pipeline or triggered by on_stop.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: manual
+      allow_failure: true
+    - when: on_success
+      allow_failure: true
+  needs: []
+
+# Check for typing inconsistencies
+typing:
+  extends:
+    - .codeanalysis-template
+    - .test-template
+  script:
+    - make typing
+  artifacts:
+    when: always
+    reports:
+      junit: build/report/mypy_junit.xml
+  cache:
+    # Caching mypy files will help reduce the typing analysis time.
+    # Cache is reused on a specific branch at a time.
+    #   - Reference: https://docs.gitlab.com/ee/ci/caching/#share-caches-between-jobs-in-the-same-branch
+    #   - Cache vs artifacts: https://gitlab.com/gitlab-org/gitlab-runner/-/issues/1232
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .mypy_cache
+    when: on_success
+
+#
+###
+
+###
+# -- Conventions and code analysis
+#
+.codeanalysis-template:
+  image: public.ecr.aws/docker/library/python:3.11
+  extends:
+    - .test-template
+  before_script:
+    # Add timestamp to logs for debugging problem with containers dying
+    - echo "UTC Timestamp"
+    - date '+%Y-%m-%dT%H:%M:%S:%3NZ'
+    - python -m venv .venv
+    - source .venv/bin/activate
+    - echo -e "machine gitlab.com\nlogin gitlab-ci-token\npassword ${CI_JOB_TOKEN}" > ~/.netrc
+    - pip install --extra-index-url https://gitlab.com/api/v4/projects/48897778/packages/pypi/simple -U pip setuptools -e '.[code_analysis]'
+      # pre-commit is needed as Make commands (like `make lint`) rely on it for consistent code quality enforcement
+    - pre-commit install
+  needs: []
+
+# Look for common error and antipatterns in the code
+lint:
+  needs:
+  extends:
+    - .codeanalysis-template
+  script:
+    - make lint
+
+# Enforce our python styleguide
+codestyle:
+  extends:
+    - .codeanalysis-template
+  script:
+    - make codestyle
+
+# Enforce our python import styleguide
+importstyle:
+  extends:
+    - .codeanalysis-template
+  script:
+    - make import-style
+
+# Enforce the python docstring styleguide
+docstringstyle:
+  extends:
+    - .codeanalysis-template
+  script:
+    - make docstring-style
+
+# Look for overly complex algorithms
+complexity:
+  extends:
+    - .codeanalysis-template
+  script:
+    - make complexity
+
+# Run linter in legacy folder
+legacy_lint:
+  stage: test
+  extends:
+    - .neutral-orgrunner
+  script:
+    - cd legacy
+    - yarn install
+    - yarn lint:check
+  image: public.ecr.aws/docker/library/node:20
+  allow_failure: false
+  only:
+    - merge_requests
+
+# code_quality:
+#   rules:
+#     - if: $CODE_QUALITY_DISABLED
+#       when: never
+#     - if: $CI_PIPELINE_SOURCE == "merge_request_event" # Run code quality job in merge request pipelines
+#     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # Run code quality job in pipelines on the default branch (but not in other branch pipelines)
+#     - if: $CI_COMMIT_TAG # Run code quality job in pipelines for tags
+
+#
+###
+
+#####
+# endregion
+##############################################################################
+
+##############################################################################
+# -- STAGE: report -----------------------------------------------------------
+# region report
+#####
+
+# Various SQA reports
+coverage:
+  extends:
+    - .neutral-orgrunner
+  stage: report
+  script:
+    - pip install -U pip setuptools coverage
+    - coverage report
+    - coverage html
+    - coverage xml
+  image: public.ecr.aws/docker/library/python:3.11
+  artifacts:
+    when: always
+    paths:
+      - build/report/coverage
+    reports:
+      junit: build/report/*.xml
+  needs:
+    - pytest_unit
+    - pytest_integration
+    - pytest_functional_http
+    - pytest_functional_consumers
+  coverage: '/TOTAL +\d+ +\d+ +\d+ +\d+ +(\d+)%/'
+  rules:
+    # Only on branches and never on schedule
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: on_success
+
+#####
+# endregion
+##############################################################################
+
+##############################################################################
+# -- STAGE: release ----------------------------------------------------------
+# region release
+#####
+
+###
+# Runs Mongo DB migrations on QA
+mongo_migrations_up_qa:
+  extends:
+    - .neutral-orgrunner
+    - .qa-orgrunner
+  image: public.ecr.aws/docker/library/node:20
+  stage: release
+  variables:
+    MIGRATE_MONGO_URL: ${qa_admin_connection_string}
+  parallel:
+    matrix:
+      - MONGO_MIGRATION_TARGET: qa-tmsWorkflow
+        MONGO_MIGRATION_FOLDER: workflow
+      - MONGO_MIGRATION_TARGET: qa-tmsMeasurement
+        MONGO_MIGRATION_FOLDER: measurement
+  script:
+    - cd legacy
+    - yarn migrate:up
+  needs: ["build_legacy_dist"]
+  rules:
+    # Only run after a merge on default branch
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+###
+# Runs Mongo DB migrations on PROD
+mongo_migrations_up_prod:
+  image: public.ecr.aws/docker/library/node:20
+  stage: release
+  extends:
+    - .prod-orgrunner
+  variables:
+    MIGRATE_MONGO_URL: ${prod_admin_connection_string}
+  parallel:
+    matrix:
+      - MONGO_MIGRATION_TARGET: prod-tmsWorkflow
+        MONGO_MIGRATION_FOLDER: workflow
+      - MONGO_MIGRATION_TARGET: prod-tmsMeasurement
+        MONGO_MIGRATION_FOLDER: measurement
+  script:
+    - cd legacy
+    - yarn migrate:up
+  needs:
+    - build_legacy_dist
+    - deploy_prod
+  rules:
+    # Only run after a merge on default branch
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+
+###
+# Deploy to QA env, mainly for use by other teams
+deploy_qa:
+  extends:
+    - .release-template
+    - .infrastructure-deploy
+    - .qa-orgrunner
+    - .large-template
+  image: public.ecr.aws/docker/library/python:3.11
+  variables:
+    GOOGLE_APPLICATION_CREDENTIALS_CONTENT: $VAR_GOOGLE_APPLICATION_CREDENTIALS_DEPLOYBOT_DEVELOPMENT
+    GOOGLE_APPLICATION_CREDENTIALS: gcp_secret.json
+    # Variables for tool tests
+    GCIP_GOOGLEIDP_CLIENTID: 425185526028-2nhud855bca84vnd4dfrrkhl4ruav7p9.apps.googleusercontent.com
+    GCIP_GOOGLEIDP_CLIENTSECRET: 8cSZjzuLsRPNSNrb5nMuqipz
+    GCIP_FIREBASE_API_KEY: $FIREBASE_QA_API_KEY
+    GOOGLE_PROJECT: orgapis-qa-316302
+    GOOGLE_REGION: northamerica-northeast1
+    GCIP_PROJECT_ID: $GOOGLE_PROJECT
+    GCIP_REGION: $GOOGLE_REGION
+    CI_DEBUG_TRACE: "false"
+    MQ_ADMINISTRATOR_USER: $MQ_ADMINISTRATOR_USER_QA
+    MQ_ADMINISTRATOR_PASSWORD: $MQ_ADMINISTRATOR_PASSWORD_QA
+    DLQ_ALARMS_EMAIL: $DLQ_ALARMS_EMAIL
+    DLQ_ALARMS_EMAIL_SUPPORT: $DLQ_ALARMS_EMAIL_SUPPORT
+    # Variables for db migration
+    SQL_SCHEME: postgresql+asyncpg
+    SQL_USERNAME: adminservices_write
+    SQL_PASSWORD: $Database_adminservices_write_QA
+    SQL_HOST: $ADMIN_DB_HOST_QA
+    SQL_PORT: 5432
+    SQL_DBNAME: adminservices
+    SQL_SCHEMA: public
+  script:
+    - tool -vv infra deploy qa --no-dryrun
+    - export $(cat ./deploy.env | xargs)
+    # Run the tests againsts the deployed environment
+    # TODO: Move the smoke test AFTER platform deployment
+    # tool -vv check test --suite test/smoke --stateful --skip-slow --live-api-url "https://admin.orgexchangeplatform.ninja"
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    paths:
+      - deploy.env
+  environment:
+    name: deployment/qa
+    deployment_tier: testing
+    url: $LIVE_API_URL
+  resource_group: qa
+  needs:
+    - gcip_zip
+    - mongo_migrations_up_qa
+  rules:
+    # Only run after a merge on default branch
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+###
+# Init infra script against QA env
+init_qa:
+  extends:
+    - .release-template
+    - .qa-orgrunner
+  image: public.ecr.aws/docker/library/python:3.11
+  variables:
+    STAGE: qa
+    MQ_ADMINISTRATOR_USER: $MQ_ADMINISTRATOR_USER_QA
+    MQ_ADMINISTRATOR_PASSWORD: $MQ_ADMINISTRATOR_PASSWORD_QA
+    MQ_MEASUREMENT_PASSWORD: $MQ_MEASUREMENT_PASSWORD_QA
+    MQ_WORKFLOW_PASSWORD: $MQ_WORKFLOW_PASSWORD_QA
+    MQ_ATTACHMENTS_PASSWORD: $MQ_ATTACHMENTS_PASSWORD_QA
+    MQ_COMMENTS_PASSWORD: $MQ_COMMENTS_PASSWORD_QA
+    MQ_ADMIN_PASSWORD: $MQ_ADMIN_PASSWORD_QA
+    MQ_TOPOLOGY_PASSWORD: $MQ_TOPOLOGY_PASSWORD_QA
+  script:
+    - export $(cat ./deploy.env | xargs)
+    - cd infra/init_scripts
+    - python -m venv .venv
+    - source .venv/bin/activate
+    - pip install -r requirements.txt
+    - python3 rabbitmq.py
+    - echo "Init QA done"
+  needs:
+    - deploy_qa
+  rules:
+    # Only run after a merge on default branch
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+
+test_large_qa:
+  extends:
+    - .release-template
+    - .install-testing
+    - .qa-orgrunner
+  variables:
+    # GCP
+    GOOGLE_APPLICATION_CREDENTIALS_CONTENT: $VAR_GOOGLE_APPLICATION_CREDENTIALS_ADMINSDK_DEVELOPMENT
+    GOOGLE_APPLICATION_CREDENTIALS: gcp_secret.json
+    GOOGLE_PROJECT: orgapis-qa-316302
+    AWS_DEFAULT_REGION: us-east-1
+    # Fetch these two from
+    # https://console.cloud.google.com/apis/credentials/oauthclient/143993548817-66pa592d1uljv4a4i77spn6m6vt255hv.apps.googleusercontent.com?project=orgapis-mr
+    GCIP_GOOGLEIDP_CLIENTID: 425185526028-2nhud855bca84vnd4dfrrkhl4ruav7p9.apps.googleusercontent.com
+    GCIP_GOOGLEIDP_CLIENTSECRET: 8cSZjzuLsRPNSNrb5nMuqipz
+    ###
+    # Application configuration
+    ##
+    ENV: qa
+    GCIP_PROJECT_ID: $GOOGLE_PROJECT
+    GCIP_REGION: $GOOGLE_REGION
+    GCIP_FIREBASE_API_KEY: $FIREBASE_QA_API_KEY
+    MONGO_SCHEME: mongodb+srv
+    MONGO_USERNAME: OpticalMaster
+    MONGO_PASSWORD: $qa_db_password
+    MONGO_HOST: tms-mongo-cluster.wahed.mongodb.net
+    MONGO_PORT: 27017
+    MONGO_DBNAME: qa-tmsAdmin # We reuse the QA database, ok: we read only
+    MONGO_CLIENT_OPTS: '{"retryWrites": true, "w": "majority"}'
+    MONGO_WORKFLOW_DBNAME: qa-tmsWorkflow
+    MONGO_MEASUREMENT_DBNAME: qa-tmsMeasurement
+    SQL_SCHEME: postgresql+asyncpg
+    SQL_USERNAME: adminservices_write
+    SQL_PASSWORD: $Database_adminservices_write_QA
+    SQL_HOST: $ADMIN_DB_HOST_QA
+    SQL_PORT: 5432
+    SQL_DBNAME: adminservices
+    LOG_LEVEL: debug
+    CORS_ORIGINS: '["*"]'
+    CORS_METHODS: '["*"]'
+    CORS_HEADERS: '["*","authorization"]'
+    CORS_EXPOSE_HEADERS: '["*"]'
+    DEVICE_VERIFICATION_URI: http://localhost:4200/activate
+    ###
+    # Parameters for SQL migrations with "The Tool"
+    TOOL_MIGRATION_POSTGRES_SCHEME: $SQL_SCHEME
+    TOOL_MIGRATION_POSTGRES_USERNAME: $SQL_USERNAME
+    TOOL_MIGRATION_POSTGRES_PASSWORD: $Database_adminservices_write_QA
+    TOOL_MIGRATION_POSTGRES_HOST: $SQL_HOST
+    TOOL_MIGRATION_POSTGRES_PORT: $SQL_PORT
+    TOOL_MIGRATION_POSTGRES_DBNAME: $SQL_DBNAME
+    ATTACHMENTS_BUCKET: exchange-attachments-qa
+    EXPORT_BUCKET: exchange-exports-qa
+    MEASUREMENT_URL: https://measurement.orgexchangeplatform.ninja
+    ATTACHMENT_URL: https://attachment.orgexchangeplatform.ninja
+    SUBSCRIPTION_SERVICE_URL: https://subscription.orgexchangeplatform.ninja
+    PERMISSION_URL: https://admin.orgexchangeplatform.ninja
+  script:
+    - export $(cat deploy.env | xargs)
+    - make large-test REAL_LIVE_API_URL="https://admin.orgexchangeplatform.ninja"
+  needs:
+    - deploy:python-services:platform:qa
+    - deploy_qa
+  rules:
+    # Only run after a merge on default branch
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+  allow_failure: true
+
+# Manual job to fix pulumi state file
+fix_pulumi_stack:qa:
+  extends:
+    - .fix-pulumi-stack
+    - .qa-orgrunner
+  image: public.ecr.aws/docker/library/python:3.11
+  when: manual
+  stage: release
+  variables:
+    ###
+    # Deployment credentials
+    ##
+    # AWS
+    AWS_ACCESS_KEY_ID: $AWS_CLoudOps_SAAS_development_AccessKey
+    AWS_SECRET_ACCESS_KEY: $AWS_CLoudOps_SAAS_development_SecretKey
+    # Pulumi
+    #   We don't end-to-end encrypt secrets. We could at some point.
+    PULUMI_CONFIG_PASSPHRASE: ""
+    PULUMI_STACK_NAME: qa
+    PULUMI_BACKEND_URL: s3://org-cloudops-terraform-state-saas-qa/pulumi
+    AWS_DEFAULT_REGION: us-east-1
+  script:
+    - echo "Pulumi stack file fixed"
+  rules:
+    # Only run after a merge on default branch
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+###
+# Deploy to prod env
+deploy_prod:
+  extends:
+    - .release-template
+    - .infrastructure-deploy
+    - .prod-orgrunner
+    - .large-template
+  image: public.ecr.aws/docker/library/python:3.11
+  variables:
+    GOOGLE_APPLICATION_CREDENTIALS_CONTENT: $VAR_GOOGLE_APPLICATION_CREDENTIALS_DEPLOYBOT_EXPLOITATION
+    GOOGLE_APPLICATION_CREDENTIALS: gcp_secret.json
+    # Variables for tool tests
+    GCIP_GOOGLEIDP_CLIENTID: $GCIP_GOOGLEIDP_CLIENTID_PROD
+    GCIP_GOOGLEIDP_CLIENTSECRET: $GCIP_GOOGLEIDP_CLIENTSECRET_PROD
+    GCIP_FIREBASE_API_KEY: $FIREBASE_PROD_API_KEY
+    GOOGLE_PROJECT: orgapis-exploitation-317013
+    GOOGLE_REGION: europe-west3
+    GCIP_PROJECT_ID: $GOOGLE_PROJECT
+    GCIP_REGION: $GOOGLE_REGION
+    CI_DEBUG_TRACE: "false"
+    MQ_ADMINISTRATOR_USER: $MQ_ADMINISTRATOR_USER_PROD
+    MQ_ADMINISTRATOR_PASSWORD: $MQ_ADMINISTRATOR_PASSWORD_PROD
+    DLQ_ALARMS_EMAIL: $DLQ_ALARMS_EMAIL
+    DLQ_ALARMS_EMAIL_SUPPORT: $DLQ_ALARMS_EMAIL_SUPPORT
+    # Variables for db migration
+    SQL_SCHEME: postgresql+asyncpg
+    SQL_USERNAME: adminservices_write
+    SQL_PASSWORD: $Database_adminservices_write_Prod
+    SQL_HOST: $ADMIN_DB_HOST_PROD
+    SQL_PORT: 5432
+    SQL_DBNAME: adminservices
+    SQL_SCHEMA: public
+  script:
+    - tool -vv infra deploy prod --no-dryrun
+    - export $(cat ./deploy.env | xargs)
+    # Run the tests againsts the deployed environment
+    # TODO: Move smoke test AFTER platform deployment
+    # tool -vv check test --suite test/smoke --stateful --skip-slow --live-api-url "https://admin.orgapis.com"
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    paths:
+      - deploy.env
+  environment:
+    name: deployment/prod
+    deployment_tier: production
+    url: $LIVE_API_URL
+  resource_group: prod
+  needs:
+    - gcip_zip
+  rules:
+    # Only run after a merge on default branch
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+###
+# Init infra script against QA env
+init_prod:
+  extends:
+    - .release-template
+    - .prod-orgrunner
+  image: public.ecr.aws/docker/library/python:3.11
+  variables:
+    STAGE: prod
+    MQ_ADMINISTRATOR_USER: $MQ_ADMINISTRATOR_USER_PROD
+    MQ_ADMINISTRATOR_PASSWORD: $MQ_ADMINISTRATOR_PASSWORD_PROD
+    MQ_MEASUREMENT_PASSWORD: $MQ_MEASUREMENT_PASSWORD_PROD
+    MQ_WORKFLOW_PASSWORD: $MQ_WORKFLOW_PASSWORD_PROD
+    MQ_ATTACHMENTS_PASSWORD: $MQ_ATTACHMENTS_PASSWORD_PROD
+    MQ_COMMENTS_PASSWORD: $MQ_COMMENTS_PASSWORD_PROD
+    MQ_ADMIN_PASSWORD: $MQ_ADMIN_PASSWORD_PROD
+  script:
+    - export $(cat ./deploy.env | xargs)
+    - python -m venv .venv
+    - source .venv/bin/activate
+    - cd infra/init_scripts
+    - pip install -r requirements.txt
+    - python3 rabbitmq.py
+    - echo "Init PROD done"
+  needs:
+    - deploy_prod
+  rules:
+    # Only run after a merge on default branch
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+
+# Manual job to fix pulumi state file
+fix_pulumi_stack:prod:
+  extends:
+    - .fix-pulumi-stack
+    - .prod-orgrunner
+  image: public.ecr.aws/docker/library/python:3.11
+  when: manual
+  stage: release
+  variables:
+    ###
+    # Deployment credentials
+    ##
+    # AWS
+    AWS_ACCESS_KEY_ID: $AWS_CLoudOps_SAAS_production_AccessKey
+    AWS_SECRET_ACCESS_KEY: $AWS_CLoudOps_SAAS_production_SecretKey
+    # Pulumi
+    #   We don't end-to-end encrypt secrets. We could at some point.
+    PULUMI_CONFIG_PASSPHRASE: ""
+    PULUMI_STACK_NAME: prod
+    PULUMI_BACKEND_URL: s3://org-cloudops-terraform-state-saas-production/pulumi
+    AWS_DEFAULT_REGION: eu-central-1
+  script:
+    - echo "Pulumi stack file fixed"
+  rules:
+    # Only run after a merge on default branch
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+##
+# Exchange/Platform jobs
+##
+
+.container:release:ecr:platform:
+  stage: release
+  image:
+    name: registry.gitlab.com/org/products/tandm/basecamp/oci/py_terraform
+  variables:
+    IMAGE_TAG: ${CI_COMMIT_SHORT_SHA}-${STACK}
+  script:
+    - crane auth login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - aws ecr get-login-password --region $REPO_REGION | crane auth login -u AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$REPO_REGION.amazonaws.com
+    - SRC_NAME="${SOURCE_IMAGE_NAME:-${IMAGE_NAME}}"
+    - DST_NAME="${TARGET_IMAGE_NAME:-${SRC_NAME}}"
+    - crane cp $CI_REGISTRY_IMAGE/${SRC_NAME}:${STACK}-${CI_COMMIT_SHA} ${ACCOUNT_ID}.dkr.ecr.${REPO_REGION}.amazonaws.com/${DST_NAME}:${IMAGE_TAG}
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+  allow_failure: true
+
+container:build:typescript:services:
+  extends:
+    - .container-creds
+  variables:
+    CONTAINERNAME: typescript-services
+  script:
+    - export VERSION="$(cat VERSION | xargs)"
+    - >
+      /kaniko/executor \
+        --destination $CI_REGISTRY_IMAGE/$CONTAINERNAME:qa-$CI_COMMIT_SHA \
+        --destination $CI_REGISTRY_IMAGE/$CONTAINERNAME:prod-$CI_COMMIT_SHA \
+        --destination $CI_REGISTRY_IMAGE/$CONTAINERNAME:qa-latest \
+        --destination $CI_REGISTRY_IMAGE/$CONTAINERNAME:prod-latest \
+        --context $CI_PROJECT_DIR \
+        --build-arg VERSION=$VERSION \
+        --dockerfile $CI_PROJECT_DIR/container/$CONTAINERNAME/Dockerfile \
+        --snapshotMode=redo
+  rules:
+    # Only run after a merge on default branch
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: always
+    - when: on_success
+  needs:
+    - build_admin_dist_package
+    - build_admin_requirements
+    - build_legacy_dist
+  dependencies:
+    - build_admin_dist_package
+    - build_legacy_dist
+
+container:release:platform:ecr:qa:
+  extends: .container:release:ecr:platform
+  variables:
+    STACK: qa
+    REPO_REGION: us-east-1
+    ACCOUNT_ID: "091838682574"
+    AWS_ACCESS_KEY_ID: "$AWS_CLoudOps_SAAS_development_AccessKey"
+    AWS_SECRET_ACCESS_KEY: "$AWS_CLoudOps_SAAS_development_SecretKey"
+  needs: [container:build:typescript:services, container:build:python:services:qa]
+  allow_failure: true
+  parallel:
+    matrix:
+      - SOURCE_IMAGE_NAME: typescript-services
+        TARGET_IMAGE_NAME: services-platform
+      - SOURCE_IMAGE_NAME: python-services
+        TARGET_IMAGE_NAME: admin-webapp
+
+container:release:platform:ecr:prod:
+  extends: .container:release:ecr:platform
+  variables:
+    STACK: prod
+    REPO_REGION: eu-central-1
+    ACCOUNT_ID: "180367240542"
+    AWS_ACCESS_KEY_ID: "$AWS_CLoudOps_SAAS_production_AccessKey"
+    AWS_SECRET_ACCESS_KEY: "$AWS_CLoudOps_SAAS_production_SecretKey"
+  needs:
+    [container:build:typescript:services, container:build:python:services:prod]
+  allow_failure: true
+  parallel:
+    matrix:
+      - SOURCE_IMAGE_NAME: typescript-services
+        TARGET_IMAGE_NAME: services-platform
+      - SOURCE_IMAGE_NAME: python-services
+        TARGET_IMAGE_NAME: admin-webapp
+
+##
+# Exchange/Platform jobs
+##
+# deploy containerized app to kubernetes cluster
+# using exchangectl tool
+#
+.deploy-api:platform:k8s:
+  stage: release
+  image: registry.gitlab.com/org/products/tandm/basecamp/platform/infra/exchangectl:latest
+  variables:
+    IMAGE_TAG: ${CI_COMMIT_SHORT_SHA}-${STAGE}
+  id_tokens:
+    PLATFORM_TOKEN:
+      aud: deploy-api
+  script:
+    - exchangectl deploy --project "admin" --project "attachment" --project "comment"
+      --project "export"  --project "testconfig" --project "workflow" --project "inventory"
+      --project "measurement" --project "measurement-headless"
+      --stage ${STAGE} --container_tag ${IMAGE_TAG}
+      --token $PLATFORM_TOKEN
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+
+deploy:python-services:platform:qa:
+  extends: .deploy-api:platform:k8s
+  needs:
+    - container:release:platform:ecr:qa
+    - init_qa
+  variables:
+    STAGE: qa
+
+deploy:python-services:platform:prod:
+  extends: .deploy-api:platform:k8s
+  needs:
+    - container:release:platform:ecr:prod
+    - init_prod
+    - mongo_migrations_up_prod
+  variables:
+    STAGE: prod
+
+# end of Exchange/Platform jobs
+##
+
+# Base job for HTML docs
+.doc-template:
+  extends:
+    - .release-template
+  image: public.ecr.aws/docker/library/python:3.11
+  before_script:
+    - python -m venv .venv
+    - source .venv/bin/activate
+    - echo -e "machine gitlab.com\nlogin gitlab-ci-token\npassword ${CI_JOB_TOKEN}" > ~/.netrc
+    - pip install --extra-index-url https://gitlab.com/api/v4/projects/48897778/packages/pypi/simple -U pip setuptools -e .[doc]
+  script:
+    # Add timestamp to logs for debugging problem with containers dying
+    - echo "UTC Timestamp"
+    - date '+%Y-%m-%dT%H:%M:%S:%3NZ'
+    - mv build/report/coverage/html doc/_static/embed/coverage
+    - make sphinx-doc
+    - mkdir public
+    - mv build/sphinx/html/* public/
+  artifacts:
+    paths:
+      - public
+  needs:
+    - coverage
+    - openapi
+    - openapi_public
+
+# Publish the doc as an environment
+doc-review:
+  extends:
+    - .doc-template
+  variables:
+    PUBLIC_URL: /-/products/tandm/basecamp/cloud/$CI_PROJECT_NAME/-/jobs/$CI_JOB_ID/artifacts/public
+  environment:
+    name: doc/$CI_COMMIT_REF_SLUG
+    deployment_tier: development
+    on_stop: stop-doc-review
+    auto_stop_in: 2 week
+    url: "https://org.gitlab.io/-/products/tandm/basecamp/cloud/$CI_PROJECT_NAME/-/jobs/$CI_JOB_ID/artifacts/public/apidoc/public.html, https://org.gitlab.io/-/products/tandm/basecamp/cloud/$CI_PROJECT_NAME/-/jobs/$CI_JOB_ID/artifacts/public/apidoc/redoc.html"
+  resource_group: $CI_MERGE_REQUEST_IID
+  rules:
+    # Only on branches and never on schedule
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: on_success
+
+# Publish the official docs on gitlab pages.
+pages:
+  extends:
+    - .doc-template
+  environment:
+    name: doc/production
+    deployment_tier: production
+    url: $CI_PAGES_URL
+  resource_group: prod
+  rules:
+    # Only run after a merge on default branch
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+
+# Kill the doc environment from time to time
+stop-doc-review:
+  extends:
+    - .release-template
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - echo "Remove review documentation"
+  environment:
+    name: doc/$CI_COMMIT_REF_SLUG
+    action: stop
+  rules:
+    # Run either (optionally) manually on a MR pipeline or triggered by on_stop.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: never
+    - when: manual
+      allow_failure: true
+
+rabbit_mq_delete_queue_qa:
+  extends:
+    - .qa-orgrunner
+  stage: janitor
+  when: manual
+  image: public.ecr.aws/docker/library/python:3.11
+  variables:
+    STAGE: qa
+    MQ_BROKER_HOST: b-2439d02b-aa2e-4f01-b2d6-4b78da928646.mq.us-east-1.amazonaws.com
+    MQ_ADMINISTRATOR_USER: $MQ_ADMINISTRATOR_USER_QA
+    MQ_ADMINISTRATOR_PASSWORD: $MQ_ADMINISTRATOR_PASSWORD_QA
+    MQ_MEASUREMENT_PASSWORD: $MQ_MEASUREMENT_PASSWORD_QA
+    MQ_WORKFLOW_PASSWORD: $MQ_WORKFLOW_PASSWORD_QA
+    MQ_ATTACHMENTS_PASSWORD: $MQ_ATTACHMENTS_PASSWORD_QA
+    MQ_COMMENTS_PASSWORD: $MQ_COMMENTS_PASSWORD_QA
+    MQ_ADMIN_PASSWORD: $MQ_ADMIN_PASSWORD_QA
+    MQ_TOPOLOGY_PASSWORD: $MQ_TOPOLOGY_PASSWORD_QA
+  script:
+    - export $(cat ./deploy.env | xargs)
+    - python -m venv .venv
+    - source .venv/bin/activate
+    - cd infra/init_scripts
+    - pip install -r requirements.txt
+    - python3 rabbitmq_remove_queue.py
+    - echo "Delete queue PROD done"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - when: manual
+
+rabbit_mq_delete_queue_prod:
+  stage: janitor
+  when: manual
+  image: public.ecr.aws/docker/library/python:3.11
+  extends:
+    - .prod-orgrunner
+  variables:
+    STAGE: prod
+    MQ_BROKER_HOST: b-acfe8420-396d-4168-8ab4-9857addc6ce0.mq.eu-central-1.amazonaws.com
+    MQ_ADMINISTRATOR_USER: $MQ_ADMINISTRATOR_USER_PROD
+    MQ_ADMINISTRATOR_PASSWORD: $MQ_ADMINISTRATOR_PASSWORD_PROD
+    MQ_MEASUREMENT_PASSWORD: $MQ_MEASUREMENT_PASSWORD_PROD
+    MQ_WORKFLOW_PASSWORD: $MQ_WORKFLOW_PASSWORD_PROD
+    MQ_ATTACHMENTS_PASSWORD: $MQ_ATTACHMENTS_PASSWORD_PROD
+    MQ_COMMENTS_PASSWORD: $MQ_COMMENTS_PASSWORD_PROD
+    MQ_ADMIN_PASSWORD: $MQ_ADMIN_PASSWORD_PROD
+  script:
+    - export $(cat ./deploy.env | xargs)
+    - python -m venv .venv
+    - source .venv/bin/activate
+    - cd infra/init_scripts
+    - pip install -r requirements.txt
+    - python3 rabbitmq_remove_queue.py
+    - echo "Delete queue PROD done"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - when: manual
+#####
+# endregion
+##############################################################################
+
+##############################################################################
+# -- STAGE: semver-release -----------------------------------------------------------
+# region semver-release
+#####
+#
+# Automatic semver release to ECR with gitlab tag creation.
+# For now added here, independently of regular release stage. When new deployment strategy is implemented, will remove the old release way.
+#
+
+semantic-release:
+  image: node:22
+  stage: release
+  variables:
+    GITLAB_TOKEN: $BASECAMP_PAT
+  script:
+    - echo "*** Generating the releases version using semantic-release. ***"
+    - cd semver
+    - apt update && apt-get install git-lfs -y
+    - npm install @semantic-release/gitlab @semantic-release/exec @semantic-release/git @semantic-release/changelog conventional-changelog-conventionalcommits
+    - npx semantic-release
+    - cp VERSION.txt ../VERSION.txt
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+  artifacts:
+    paths:
+      - VERSION.txt
+
+container:semver-release:platform:ecr:qa:
+  stage: release
+  variables:
+    AWS_PROFILE: "ecr-admin"
+    AWS_ROLE: "arn:aws:iam::905418345845:role/exchange-ecr-poweruser"
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com
+  before_script:
+    - mkdir -p ~/.aws
+    - echo "${GITLAB_OIDC_TOKEN}" > /tmp/web_identity_token
+    - echo -e "[profile ${AWS_PROFILE}]\nrole_arn=${AWS_ROLE}\nweb_identity_token_file=/tmp/web_identity_token" > ~/.aws/config
+  needs:
+    [
+      container:build:typescript:services,
+      container:build:python:services:qa,
+      semantic-release,
+    ]
+  allow_failure: true
+  parallel:
+    matrix:
+      - SOURCE_IMAGE_NAME: typescript-services
+        TARGET_IMAGE_NAME: services-platform
+      - SOURCE_IMAGE_NAME: python-services
+        TARGET_IMAGE_NAME: admin-webapp
+  image:
+    name: registry.gitlab.com/org/products/tandm/basecamp/oci/py_terraform
+  script:
+    - VERSION=$(cat VERSION.txt)
+    - crane auth login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - aws ecr get-login-password --region us-east-1 --profile ecr-admin | crane auth login -u AWS --password-stdin 905418345845.dkr.ecr.us-east-1.amazonaws.com
+    - SRC_NAME="${SOURCE_IMAGE_NAME:-${IMAGE_NAME}}"
+    - DST_NAME="${TARGET_IMAGE_NAME:-${SRC_NAME}}"
+    - crane cp $CI_REGISTRY_IMAGE/${SRC_NAME}:qa-${CI_COMMIT_SHA} 905418345845.dkr.ecr.us-east-1.amazonaws.com/exchange/${DST_NAME}:${VERSION}
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+#####
+# endregion
+##############################################################################
+
+##############################################################################
+# -- STAGE: DB migration -----------------------------------------------------------
+#####
+#
+.qa-postgres-variables:
+  variables:
+    SQL_SCHEME: postgresql+asyncpg
+    SQL_USERNAME: adminservices_write
+    SQL_PASSWORD: $Database_adminservices_write_QA
+    SQL_HOST: $ADMIN_DB_HOST_QA
+    SQL_PORT: 5432
+    SQL_DBNAME: adminservices
+    SQL_SCHEMA: public
+
+.prod-postgres-variables:
+  variables:
+    SQL_SCHEME: postgresql+asyncpg
+    SQL_USERNAME: adminservices_write
+    SQL_PASSWORD: $Database_adminservices_write_Prod
+    SQL_HOST: $ADMIN_DB_HOST_PROD
+    SQL_PORT: 5432
+    SQL_DBNAME: adminservices
+    SQL_SCHEMA: public
+
+.migration-job-template:
+  extends:
+    - .pypackages-template
+  when: manual
+  stage: janitor
+
+# QA Jobs
+migrate-postgres-database:qa:
+  extends:
+    - .qa-orgrunner
+    - .qa-postgres-variables
+    - .migration-job-template
+  script:
+    - make migrate-db
+
+downgrade-latest-postgres-migration:qa:
+  extends:
+    - .qa-orgrunner
+    - .qa-postgres-variables
+    - .migration-job-template
+  script:
+    - make downgrade-db
+
+# Production Jobs
+migrate-postgres-database:prod:
+  extends:
+    - .prod-orgrunner
+    - .prod-postgres-variables
+    - .migration-job-template
+  script:
+    - make migrate-db
+
+downgrade-latest-postgres-migration:prod:
+  extends:
+    - .prod-orgrunner
+    - .prod-postgres-variables
+    - .migration-job-template
+  script:
+    - make downgrade-db
+#####
+# endregion
+##############################################################################

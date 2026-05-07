@@ -1,0 +1,110 @@
+#######
+# This template was designed to be used by users of the UI Micro frontend developer.  It
+# can be include in any Micro frontend gitlab-ci.yml that wanted to create image and push images to central ECR.
+# further this image can be used in dynamic environment.This project template can be used only for 
+# environments created on sandbox account.
+#
+#
+# - The projects using the template needs to be registered in the list of project
+#   accessible from CI_JOB_TOKEN in the images-delivery-template
+#   [CI-CD Settings](https://gitlab.com/org/products/tandm/basecamp/platform/cicd/images-delivery-template/-/settings/ci_cd#:~:text=Token-,Access,-Collapse) page.
+
+
+include:
+  - template: 'Workflows/Branch-Pipelines.gitlab-ci.yml'
+
+default:
+  image: registry.gitlab.com/org/products/tandm/basecamp/oci/py_terraform:latest
+  tags:
+    - vpc-neutral
+
+.default:rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request"
+      when: never
+
+.development:context:all_the_time:
+  extends: .default:rules
+  rules:
+    - when: always
+
+.development:context:manual:
+  extends: .default:rules
+  rules:
+    - when: manual
+
+.development:context:main:
+  extends: .default:rules
+  rules:
+    - if: $CI_COMMIT_BRANCH != "main" && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: manual
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: always
+
+.development:context:onlymain:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+
+variables:  
+  IMAGE_NAME: "Test" # this need to change and fixed as per micro frontend name
+
+.setup:
+  variables:
+    AWS_PROFILE: "ecr-admin"
+    AWS_REGION: "us-east-1"
+    AWS_ROLE: "arn:aws:iam::905418345845:role/exchange-ecr-poweruser"
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com
+  before_script:
+    - mkdir -p ~/.aws
+    - echo "${GITLAB_OIDC_TOKEN}" > /tmp/web_identity_token
+    - echo -e "[profile ${AWS_PROFILE}]\nrole_arn=${AWS_ROLE}\nweb_identity_token_file=/tmp/web_identity_token" > ~/.aws/config
+
+.automatic:semantic:version:
+  image: node:22
+  stage: release
+  variables:
+    GITLAB_TOKEN: $BASECAMP_PAT
+  script:
+    - echo "*** Generating the releases version using semantic-release. ***"
+    - cd semver
+    - npm install @semantic-release/gitlab @semantic-release/exec @semantic-release/git @semantic-release/changelog conventional-changelog-conventionalcommits
+    - npx semantic-release
+    - cp VERSION.txt ../VERSION.txt
+  artifacts:
+    paths:
+    - VERSION.txt
+
+.container:create:build:
+  stage: build-release    
+  image:
+    name: gcr.io/kaniko-project/executor:v1.24.0-debug
+    entrypoint: [ "" ]
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+  tags:
+    - vpc-neutral-large
+  script:
+    - >-
+      /kaniko/executor
+      --context $CI_PROJECT_DIR
+      --build-arg CI_JOB_TOKEN=${CI_JOB_TOKEN}
+      --dockerfile $CI_PROJECT_DIR/Dockerfile
+      --destination $CI_REGISTRY_IMAGE/$IMAGE_NAME:$CI_COMMIT_SHA
+
+.push:image:ECR:
+  stage: build-release
+  image:
+    name: registry.gitlab.com/org/products/tandm/basecamp/oci/py_terraform
+    entrypoint: [""]
+  extends: .setup    
+  script:
+    - IMAGE_VERSION=$(cat VERSION.txt)
+    - echo $IMAGE_VERSION
+    - crane auth login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - aws ecr get-login-password --region us-east-1 --profile ecr-admin | crane auth login -u AWS --password-stdin 905418345845.dkr.ecr.us-east-1.amazonaws.com
+    - crane cp $CI_REGISTRY_IMAGE/$IMAGE_NAME:$CI_COMMIT_SHA 905418345845.dkr.ecr.us-east-1.amazonaws.com/exchange/$IMAGE_NAME:$IMAGE_VERSION
+  allow_failure: true
